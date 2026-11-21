@@ -53,6 +53,7 @@ if(APPLE)
     Source/Net/UdpSender.cpp
     Source/Net/NetworkEngine.cpp
     Source/UI/MixerPage.cpp
+    Source/UI/AnalyzerPanel.cpp
     Source/UI/NetworkAudioLane.cpp
     Source/UI/NetworkMidiLane.cpp
     Source/UI/NetworkPage.cpp
@@ -111,6 +112,12 @@ if(PATCHBAY_BUILD_TESTS)
   target_compile_features(netout_tests PRIVATE cxx_std_20)
   target_link_libraries(netout_tests PRIVATE Threads::Threads)
   add_test(NAME netout_tests COMMAND netout_tests)
+
+  add_executable(analysis_tests Tests/analysis_tests.cpp)
+  target_include_directories(analysis_tests PRIVATE Source)
+  target_compile_features(analysis_tests PRIVATE cxx_std_20)
+  target_link_libraries(analysis_tests PRIVATE Threads::Threads)
+  add_test(NAME analysis_tests COMMAND analysis_tests)
 
   add_executable(capture_tests Tests/capture_tests.cpp)
   target_include_directories(capture_tests PRIVATE Source)

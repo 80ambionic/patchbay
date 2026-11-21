@@ -46,6 +46,7 @@ public:
     void stop();
     bool isListening() const noexcept { return listening; }
     bool isAudioRunning() const noexcept { return audioRunning; }
+    double getSampleRate() const noexcept { return pubSampleRate.load(); }      // rate of the open output device (0 = closed)
     int  getNumOutputs() const noexcept { return pubNumOutputs.load(); }      // output channels the open device provides (0 = closed)
 
     // ---- audio input device (opt-in: opening inputs is what triggers the microphone permission prompt) ----------------

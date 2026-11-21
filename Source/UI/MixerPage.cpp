@@ -1,6 +1,7 @@
 #include "MixerPage.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "Capture/AppGrouping.h"
+#include "AnalyzerPanel.h"
 
 namespace pb
 {
@@ -9,7 +10,7 @@ namespace
 const juce::Colour kBg (0xff15171b), kAppTint (0xff6ccfb8), kInTint (0xffe2b05a), kPanel (0xff23272e), kPanelHi (0xff2a2e35), kText (0xffd8dce2), kDim (0xff8a8f98),
                    kGood (0xff6ccf8e), kWarn (0xfff0a35a), kBad (0xffe06c6c), kAccent (0xff5b9bd5), kNetTint (0xffb48ae0);
 
-constexpr int kStripW = 88, kMasterW = 124, kGap = 6, kMargin = 14, kGroupGap = 28, kHeaderH = 150, kStripH = 500, kTitleH = 22;
+constexpr int kStripW = 88, kMasterW = 124, kGap = 6, kMargin = 14, kGroupGap = 28, kHeaderH = 150, kStripH = 470, kTitleH = 22, kAnalyzerH = 196;
 constexpr float kMeterFloorDb = -60.0f, kMeterCeilDb = 6.0f;
 
 float toDb (float lin) noexcept { return lin <= 1.0e-6f ? -120.0f : 20.0f * std::log10 (lin); }
@@ -37,10 +38,18 @@ void styleFader (juce::Slider& fader, int textBoxWidth)
         return s.startsWith ("-inf") ? (double) kMinGainDb : (double) clampGainDb (s.getFloatValue());
     };
     fader.setColour (juce::Slider::trackColourId, kPanelHi);
-    fader.setColour (juce::Slider::thumbColourId, kAccent);
+    fader.setColour (juce::Slider::thumbColourId, juce::Colour (0xff4a4f58));
     fader.setColour (juce::Slider::textBoxTextColourId, kText);
     fader.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
     fader.setValue (0.0, juce::dontSendNotification);
+}
+
+void styleScopeButton (juce::TextButton& b)
+{
+    b.setClickingTogglesState (false);                       // the page makes the selection exclusive
+    b.setColour (juce::TextButton::buttonOnColourId, kAccent.darker (0.1f));
+    b.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+    b.setTooltip ("Show this track in the analyzer at the top");
 }
 
 void styleNameLabel (juce::Label& l, bool editable, float size, bool bold)
@@ -163,7 +172,7 @@ public:
         balance.setRange (-1.0, 1.0, 0.01);
         balance.setDoubleClickReturnValue (true, 0.0);
         balance.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-        balance.setColour (juce::Slider::rotarySliderFillColourId, kAccent);
+        balance.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xff3d6fb5));
         balance.setColour (juce::Slider::thumbColourId, kText);
         balance.onValueChange = [this] { balText.setText ("Bal " + balanceText (balance.getValue()), juce::dontSendNotification); push(); };
         addAndMakeVisible (balance);
@@ -185,6 +194,10 @@ public:
         soloButton.onClick = [this] { push(); };
         addAndMakeVisible (soloButton);
 
+        styleScopeButton (scopeButton);
+        scopeButton.onClick = [this] { if (onScope) onScope(); };
+        addAndMakeVisible (scopeButton);
+
         styleFader (fader, kStripW - 20);
         fader.onValueChange = [this] { push(); };
         addAndMakeVisible (fader);
@@ -194,6 +207,9 @@ public:
     }
 
     std::function<void (const StripSettings&)> apply;
+    std::function<void()> onScope;                       // the A button: show this strip in the analyzer
+    void setScopeOn (bool on) { scopeButton.setToggleState (on, juce::dontSendNotification); }
+    juce::String displayName() const { return nameLabel.getText(); }
 
     StripSettings getStrip() const
     {
@@ -258,9 +274,12 @@ public:
 
         auto buttons = r.removeFromBottom (28);
         r.removeFromBottom (6);
-        muteButton.setBounds (buttons.removeFromLeft (buttons.getWidth() / 2 - 2));
+        const int bw = (buttons.getWidth() - 8) / 3;
+        muteButton.setBounds (buttons.removeFromLeft (bw));
         buttons.removeFromLeft (4);
-        soloButton.setBounds (buttons);
+        soloButton.setBounds (buttons.removeFromLeft (bw));
+        buttons.removeFromLeft (4);
+        scopeButton.setBounds (buttons);
 
         auto meterCol = r.removeFromRight (24);
         meter.setBounds (meterCol.withTrimmedBottom (22));
@@ -342,7 +361,7 @@ private:
     juce::Label nameLabel, balText;
     juce::ComboBox sourceBox, outBox;
     juce::Slider balance, fader;
-    juce::TextButton muteButton { "M" }, soloButton { "S" };
+    juce::TextButton muteButton { "M" }, soloButton { "S" }, scopeButton { "A" };
     Meter meter;
 };
 
@@ -402,6 +421,13 @@ public:
         muteButton.onClick = [this] { push(); };
         addAndMakeVisible (muteButton);
 
+        if (! master)
+        {
+            styleScopeButton (scopeButton);
+            scopeButton.onClick = [this] { if (onScope) onScope(); };
+            addAndMakeVisible (scopeButton);
+        }
+
         styleFader (fader, (master ? kMasterW : kStripW) - 20);
         fader.onValueChange = [this] { push(); };
         addAndMakeVisible (fader);
@@ -412,6 +438,9 @@ public:
     }
 
     std::function<void (const BusSettings&)> apply;
+    std::function<void()> onScope;                       // the A button (buses only)
+    void setScopeOn (bool on) { scopeButton.setToggleState (on, juce::dontSendNotification); }
+    juce::String displayName() const { return nameLabel.getText(); }
 
     BusSettings getBus() const
     {
@@ -485,7 +514,13 @@ public:
 
         auto buttons = r.removeFromBottom (28);
         r.removeFromBottom (6);
-        muteButton.setBounds (buttons);
+        if (master) muteButton.setBounds (buttons);
+        else
+        {
+            muteButton.setBounds (buttons.removeFromLeft (buttons.getWidth() / 2 - 2));
+            buttons.removeFromLeft (4);
+            scopeButton.setBounds (buttons);
+        }
 
         auto meterCol = r.removeFromRight (master ? 36 : 24);
         meter.setBounds (meterCol.withTrimmedBottom (22));
@@ -575,7 +610,7 @@ private:
     NetDest dest;
     juce::Label nameLabel;
     juce::ComboBox typeBox, outBox;
-    juce::TextButton netButton { "Set destination..." }, muteButton { "M" };
+    juce::TextButton netButton { "Set destination..." }, muteButton { "M" }, scopeButton { "A" };
     juce::Slider fader;
     Meter meter;
     juce::Rectangle<int> clipArea;
@@ -882,10 +917,12 @@ private:
 // ---------------------------------------------------------------------------------------------------------------
 MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
 {
+    setLookAndFeel (&ssl);
     for (int i = 0; i < kStrips; ++i)
     {
         auto s = std::make_unique<InputStrip> (i, [this] { changed(); });
         s->apply = [this, i] (const StripSettings& st) { applyStrip (i, st); };
+        s->onScope = [this, i] { selectScope (i); };
         content.addAndMakeVisible (*s);
         content.strips.push_back (s.get());
         strips.push_back (std::move (s));
@@ -895,6 +932,7 @@ MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
     {
         auto s = std::make_unique<OutputStrip> (false, b, [this] { changed(); });
         s->apply = [this, b] (const BusSettings& bs) { applyBus (b, bs); };
+        s->onScope = [this, b] { selectScope (kStrips + b); };
         content.addAndMakeVisible (*s);
         content.buses.push_back (s.get());
         busStrips.push_back (std::move (s));
@@ -914,6 +952,9 @@ MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
     inputPanel = std::make_unique<InputPanel> (engine);
     content.addAndMakeVisible (*inputPanel);
     content.inputPanel = inputPanel.get();
+
+    analyzer = std::make_unique<AnalyzerPanel> (core, [this] { return engine.getSampleRate(); });
+    addAndMakeVisible (*analyzer);
 
     viewport.setViewedComponent (&content, false);
     viewport.setScrollBarsShown (true, true);
@@ -959,10 +1000,11 @@ MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
 
     setSettings (MixerSettings());
     syncOutputChoices();
+    selectScope (0);                                      // the analyzer starts on strip 1
     startTimerHz (30);
 }
 
-MixerPage::~MixerPage() { stopTimer(); }
+MixerPage::~MixerPage() { stopTimer(); analyzer.reset(); setLookAndFeel (nullptr); }
 
 MixerSettings MixerPage::getSettings() const
 {
@@ -1027,8 +1069,23 @@ void MixerPage::applyAppNames()
     for (auto& s : strips) s->setAppNames (appNames);
 }
 
+void MixerPage::selectScope (int target)
+{
+    for (int i = 0; i < kStrips; ++i) strips[(size_t) i]->setScopeOn (i == target);
+    for (int b = 0; b < kBuses; ++b) busStrips[(size_t) b]->setScopeOn (kStrips + b == target);
+    analyzer->setTarget (target, scopeName (target));
+}
+
+juce::String MixerPage::scopeName (int target) const
+{
+    if (target >= 0 && target < kStrips) return strips[(size_t) target]->displayName();
+    if (target >= kStrips && target < kStrips + kBuses) return busStrips[(size_t) (target - kStrips)]->displayName();
+    return {};
+}
+
 void MixerPage::changed()
 {
+    if (analyzer != nullptr) analyzer->setTargetName (analyzer->getTarget(), scopeName (analyzer->getTarget()));
     applyAppNames();
     updatePresetStatus();
     if (onSettingsChanged) onSettingsChanged();
@@ -1192,6 +1249,8 @@ void MixerPage::resized()
     initButton.setBounds (bar.removeFromLeft (56));
     bar.removeFromLeft (12);
     presetStatus.setBounds (bar);
+
+    analyzer->setBounds (r.removeFromTop (kAnalyzerH).reduced (kMargin - 6, 0));
 
     // The master stays in view on the right while the strips and buses scroll.
     auto masterArea = r.removeFromRight (kMasterW + 2 * kMargin);

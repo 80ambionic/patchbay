@@ -30,6 +30,9 @@
 #include <atomic>
 #include <cmath>
 #include "MixerSettings.h"
+#include "Dsp/Loudness.h"
+#include "Net/SpscQueue.h"
+#include "ScopeRing.h"
 
 namespace pb
 {
@@ -112,6 +115,35 @@ public:
     void setMasterMute (bool m) noexcept { masterMute.store (m, std::memory_order_relaxed); }
     void setMasterType (OutType t) noexcept { masterType.store (t == OutType::net ? 1 : 0, std::memory_order_relaxed); }
     void setMasterOut (int firstCh) noexcept { masterOut.store (clampOutFirst (firstCh), std::memory_order_relaxed); }
+
+    // ---- analyzer taps (UI side) ------------------------------------------------------------------------------
+    /** Which signal feeds the analyzer's scope ring: a strip (0..31) or a bus (32..63), or -1 for none. `post` = after the
+        fader (strip: after fader, balance and mute; bus: after the bus fader), otherwise the signal going in. */
+    void setScope (int target, bool post) noexcept
+    {
+        scopePost.store (post, std::memory_order_relaxed);
+        scopeTarget.store (target >= 0 && target < kStrips + kBuses ? target : -1, std::memory_order_relaxed);
+    }
+    const ScopeRing& scopeRing() const noexcept { return scope; }
+    const ScopeRing& masterRing() const noexcept { return masterScope; }
+
+    /** Master loudness hops (100 ms each), oldest first. Returns false when none are waiting. UI thread only. */
+    bool popLoudnessHop (dsp::LoudnessHop& h) noexcept
+    {
+        const auto* p = hopQueue.peek();
+        if (p == nullptr) return false;
+        h = *p; hopQueue.release();
+        return true;
+    }
+    int loudnessHopsDropped() const noexcept { return hopDrops.load (std::memory_order_relaxed); }
+
+    /** Call while the audio thread is not running (device start). Sets the rate for the loudness filters. */
+    void prepareAnalysis (double sampleRate) noexcept
+    {
+        blockMaker.prepare (sampleRate);
+        dsp::LoudnessHop discard;
+        while (popLoudnessHop (discard)) {}
+    }
 
     /** Peaks since the previous call (the call resets them). Call from the UI thread. */
     Peaks takePeaks() noexcept
@@ -224,6 +256,8 @@ public:
 
         // ---- strips
         const float invFrames = 1.0f / (float) frames;
+        const int tapTarget = scopeTarget.load (std::memory_order_relaxed);
+        const bool tapPost = scopePost.load (std::memory_order_relaxed);
         for (int i = 0; i < kStrips; ++i)
         {
             const auto k = (size_t) i;
@@ -261,6 +295,7 @@ public:
                     gl += dL; gr += dR;
                     dl[n] += xl * gl;
                     dr[n] += xr * gr;
+                    if (tapTarget == i) scope.pushOne (tapPost ? xl * gl : xl, tapPost ? xr * gr : xr);
                 }
                 raise (stripPeakL[k], peakL * faderLin[k]);
                 raise (stripPeakR[k], peakR * faderLin[k]);
@@ -282,6 +317,7 @@ public:
                     }
                 }
             }
+            else if (tapTarget == i) pushSilence (frames);                    // a strip with no signal shows an empty spectrum
             curL[k] = tgtL[k]; curR[k] = tgtR[k]; prevDest[k] = dest[k];      // land exactly on the target
         }
 
@@ -291,7 +327,7 @@ public:
         for (int b = 0; b < kBuses; ++b)
         {
             const auto k = (size_t) b;
-            if (! active[k]) continue;
+            if (! active[k]) { if (tapTarget == kStrips + b) pushSilence (frames); continue; }
             const float dB = (tgtBus[k] - curBus[k]) * invFrames;
             float g = curBus[k];
             float pl = 0.0f, pr = 0.0f;
@@ -300,10 +336,12 @@ public:
             for (int n = 0; n < frames; ++n)
             {
                 g += dB;
+                if (tapTarget == kStrips + b && ! tapPost) scope.pushOne (l[n], r[n]);
                 float xl = l[n] * g, xr = r[n] * g;
                 if (xl > 1.0f || xl < -1.0f) { clip = true; xl = xl > 0.0f ? 1.0f : -1.0f; }
                 if (xr > 1.0f || xr < -1.0f) { clip = true; xr = xr > 0.0f ? 1.0f : -1.0f; }
                 l[n] = xl; r[n] = xr;
+                if (tapTarget == kStrips + b && tapPost) scope.pushOne (xl, xr);
                 pl = std::max (pl, std::abs (xl)); pr = std::max (pr, std::abs (xr));
             }
             curBus[k] = tgtBus[k];
@@ -325,6 +363,12 @@ public:
             pl = std::max (pl, std::abs (l)); pr = std::max (pr, std::abs (r));
         }
         curMaster = tgtMaster;
+        masterScope.push (out.masterL, out.masterR, frames);
+        blockMaker.process (out.masterL, out.masterR, frames, [this] (const dsp::LoudnessHop& h)
+        {
+            if (auto* slot = hopQueue.acquireWrite()) { *slot = h; hopQueue.publish(); }
+            else hopDrops.fetch_add (1, std::memory_order_relaxed);
+        });
         raise (peakL, pl);
         raise (peakR, pr);
         if (clip) clipped.store (true, std::memory_order_relaxed);
@@ -335,6 +379,12 @@ public:
 
 private:
     static constexpr float kHalfPi = 1.57079632679489661923f;
+
+    void pushSilence (int frames) noexcept
+    {
+        static constexpr float zeros[256] = {};
+        for (int done = 0; done < frames; done += 256) { const int n = std::min (256, frames - done); scope.push (zeros, zeros, n); }
+    }
 
     static bool validStrip (int i) noexcept { return i >= 0 && i < kStrips; }
     static bool validBus (int b) noexcept { return b >= 0 && b < kBuses; }
@@ -370,6 +420,14 @@ private:
     std::array<std::atomic<float>, kBuses> busPeakL {}, busPeakR {};
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
     std::atomic<bool> clipped { false };
+
+    // Analyzer taps.
+    ScopeRing scope, masterScope;
+    std::atomic<int> scopeTarget { -1 };
+    std::atomic<bool> scopePost { false };
+    net::SpscQueue<dsp::LoudnessHop, 256> hopQueue;
+    std::atomic<int> hopDrops { 0 };
+    dsp::LoudnessBlockMaker blockMaker;
 
     // Audio-thread state.
     std::array<float, kStrips> curL {}, curR {};

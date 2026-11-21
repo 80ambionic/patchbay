@@ -316,6 +316,7 @@ void NetworkEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
         busBufR[i].assign ((size_t) kSliceFrames, 0.0f); busPtrR[i] = busBufR[i].data();
     }
     packetizer.reset();
+    mixer.prepareAnalysis (rate);               // loudness filters for this sample rate
     mixer.reset();                              // first block jumps to the fader positions instead of fading in
 
     playout.reset();

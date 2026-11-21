@@ -7,9 +7,11 @@
 #include "Mixer/MixerSettings.h"
 #include "MixerPresets.h"
 #include "Net/NetworkEngine.h"
+#include "SslLookAndFeel.h"
 
 namespace pb
 {
+class AnalyzerPanel;
 /** Page 3: the mixer console.
       - 32 stereo input strips. Each has an Input menu (Off, a network pair, an app slot, or a stereo pair of the audio input
         device) above an Output menu (Master or one of the 32 buses), a balance knob, mute/solo and a fader.
@@ -50,6 +52,8 @@ private:
 
     void timerCallback() override;
     void changed();
+    void selectScope (int target);                 // strip 0..31 or bus 32..63 into the analyzer
+    juce::String scopeName (int target) const;
     void syncOutputChoices();
     void applyStrip (int i, const StripSettings&);
     void applyBus (int b, const BusSettings&);
@@ -63,6 +67,7 @@ private:
     void promptDelete();
     void updatePresetStatus();
 
+    SslLookAndFeel ssl;                            // declared first: must outlive every child that uses it
     net::NetworkEngine& engine;
     MixerCore& core;
     MixerPresets presets { MixerPresets::defaultFolder() };
@@ -72,6 +77,7 @@ private:
     std::unique_ptr<OutputStrip> master;
     std::vector<std::unique_ptr<AppSlotPanel>> slotPanels;
     std::unique_ptr<InputPanel> inputPanel;
+    std::unique_ptr<AnalyzerPanel> analyzer;
     Content content;
     juce::Viewport viewport;
 

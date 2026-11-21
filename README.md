@@ -74,7 +74,21 @@ panel), then the 32 input strips and the 32 output buses side by side (scroll si
 - Gain and routing changes ramp across the audio block (no zipper noise or clicks). Non-finite samples from a bad sender
   are replaced by silence.
 
-### Presets
+### Mixer look and analyzer (Beta.2)
+
+- **Look:** `Source/UI/SslLookAndFeel.h` draws the knobs (coloured cap, white pointer, tick scale), the long-throw faders
+  (dB scale, rectangular cap with a white centre line) and the illuminated M / S / A switches in a large-format console style.
+- **Analyzer window** across the top of the Mixer page:
+  - *Track analyzer* (left): press **A** on any strip or bus to show it. The **Input / Output** toggle picks the signal going into
+    the track (before its fader) or leaving it (after fader, balance and mute; for a bus, after the bus fader). Log-frequency
+    spectrum, 4096-point FFT, with a peak readout in Hz and dB.
+  - *Master analyzer* (right): the master output spectrum with the peak frequency, plus loudness per ITU-R BS.1770-4 / EBU R128:
+    momentary (400 ms), short-term (3 s), integrated (gated), loudness range, and true peak (4x oversampled). **Reset** restarts
+    the integrated, range and peak measurements.
+- The audio thread only copies samples into wait-free rings (`Source/Mixer/ScopeRing.h`) and 100 ms loudness summaries; all
+  FFT and gating work happens on the UI thread. Tests: `Tests/analysis_tests.cpp`.
+
+## Presets
 The bar at the top saves the whole mixer under a name: every strip (source, fader, balance, mute, solo, output, name), every
 bus and the master (fader, mute, Audio Out / Net Out, device pair or destination, name) and the four app targets. Files are
 `<app data>/PatchBay/Presets/<name>.pbmix` (small JSON). Choose a name from the menu to load it, **Save** to update the
