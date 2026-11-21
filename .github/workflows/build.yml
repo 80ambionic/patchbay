@@ -24,7 +24,7 @@ jobs:
       - run: chmod +x scripts/*.sh && scripts/build_ios.sh simulator
       - name: Zip the simulator app
         run: |
-          find build -name '*.app' -maxdepth 6 -type d | head; APP=$(find build -type d -name '*.app' -path '*iphonesimulator*' | head -1)
+          APP=build/ios/PatchBay_artefacts/Release/PatchBay.app
           echo "Found: $APP"
           test -n "$APP"
           (cd "$(dirname "$APP")" && zip -qr "$GITHUB_WORKSPACE/PatchBay-iOS-simulator.zip" "$(basename "$APP")")
