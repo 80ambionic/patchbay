@@ -22,3 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: chmod +x scripts/*.sh && scripts/build_ios.sh simulator
+      - run: cd build/ios-derived/Build/Products/Release-iphonesimulator && zip -qr "$GITHUB_WORKSPACE/PatchBay-iOS-simulator.zip" PatchBay.app
+      - uses: actions/upload-artifact@v4
+        with: { name: PatchBay-iOS-simulator, path: PatchBay-iOS-simulator.zip }

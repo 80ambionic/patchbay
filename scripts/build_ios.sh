@@ -11,8 +11,8 @@ PROJ="build/ios/PatchBay.xcodeproj"
 
 if [ "$MODE" = "simulator" ]; then
   xcodebuild -project "$PROJ" -scheme PatchBay -configuration Release -sdk iphonesimulator \
-             -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
-  echo "Simulator app is under ~/Library/Developer/Xcode/DerivedData/*/Build/Products/Release-iphonesimulator/"
+             -destination 'generic/platform=iOS Simulator' -derivedDataPath build/ios-derived CODE_SIGNING_ALLOWED=NO build
+  echo "Simulator app is under build/ios-derived/Build/Products/Release-iphonesimulator/"
 else
   : "${TEAM_ID:?set TEAM_ID to your Apple Developer team id}"
   xcodebuild -project "$PROJ" -scheme PatchBay -configuration Release -sdk iphoneos \
