@@ -58,6 +58,7 @@ bool NetworkEngine::ensureAudioRunning (juce::String& error)
     if (audioRunning) return true;
     if (auto err = prepareDevice(); err.isNotEmpty()) { error = "Audio output: " + err; return false; }
     if (deviceManager.getCurrentAudioDevice() == nullptr) { error = "No audio output device is available."; return false; }
+    sender.start();                             // Net Out socket + thread; harmless if nothing is routed to the network
     deviceManager.addAudioCallback (this);      // calls audioDeviceAboutToStart() synchronously for the open device
     audioRunning = true;
     return true;
@@ -74,6 +75,7 @@ void NetworkEngine::releaseAudioIfIdle()
     if (! audioRunning || listening || anyCaptureOn() || inputsOn) return;
     deviceManager.removeAudioCallback (this);   // waits for an in-flight callback; calls audioDeviceStopped()
     audioRunning = false;
+    sender.stop();
     deviceManager.closeAudioDevice();           // release the hardware while nothing needs it
     pubPrimed = false;
     pubDeviceOpen = false;
@@ -172,9 +174,9 @@ bool NetworkEngine::setDeviceInputsEnabled (bool on, juce::String& error)
 
         if (problem.isEmpty())
         {
-            // Ask the device how many input channels it has instead of guessing, then open exactly min(that, 8).
+            // Ask the device how many input channels it has instead of guessing, then open exactly min(that, kMaxDeviceInputs).
             std::unique_ptr<juce::AudioIODevice> probe (type->createDevice (setup.outputDeviceName, setup.inputDeviceName));
-            const int n = probe != nullptr ? std::min (probe->getInputChannelNames().size(), kInputStrips) : 0;
+            const int n = probe != nullptr ? std::min (probe->getInputChannelNames().size(), kMaxDeviceInputs) : 0;
             if (n <= 0) problem = "The input device has no input channels.";
             else
             {
@@ -276,6 +278,25 @@ void NetworkEngine::refreshCaptures()
         if (captureOn[(size_t) i]) captureSessions[(size_t) i]->refresh();
 }
 
+// ---- Net Out ----------------------------------------------------------------------------------------------------
+void NetworkEngine::setNetOutDestination (int stream, const std::string& host, int port)
+{
+    if (stream < 0 || stream >= kNetOutStreams) return;
+    const bool usable = ! host.empty() && isValidHost (host) && port >= 1 && port <= 65535;
+    sender.setDestination (stream, usable ? host : std::string(), usable ? port : 0);
+    netDestSet[(size_t) stream].store (usable, std::memory_order_relaxed);
+}
+
+NetworkEngine::NetOutStats NetworkEngine::getNetOutStats() const
+{
+    NetOutStats s;
+    const auto& c = sender.counters();
+    s.sent = c.sent.load(); s.failed = c.failed.load(); s.unrouted = c.unrouted.load();
+    s.queueDrops = pubNetDrops.load();
+    s.running = sender.isRunning();
+    return s;
+}
+
 // ---- audio device lifecycle -------------------------------------------------------------------------------------
 void NetworkEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
 {
@@ -286,10 +307,15 @@ void NetworkEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     scratch.assign ((size_t) kSliceFrames * (size_t) std::max (1, streamChannels), 0.0f);
     mixL.assign ((size_t) kSliceFrames, 0.0f);
     mixR.assign ((size_t) kSliceFrames, 0.0f);
-    appBuf.assign ((size_t) kSliceFrames * (size_t) kAppStrips, 0.0f);
+    appBuf.assign ((size_t) kSliceFrames * (size_t) (kAppSlots * 2), 0.0f);
     capTmp.assign ((size_t) kSliceFrames * 2, 0.0f);
-    devBuf.assign ((size_t) kSliceFrames * (size_t) kInputStrips, 0.0f);
-    for (size_t i = 0; i < directBuf.size(); ++i) { directBuf[i].assign ((size_t) kSliceFrames, 0.0f); directPtrs[i] = directBuf[i].data(); }
+    devBuf.assign ((size_t) kSliceFrames * (size_t) kMaxDeviceInputs, 0.0f);
+    for (size_t i = 0; i < busBufL.size(); ++i)
+    {
+        busBufL[i].assign ((size_t) kSliceFrames, 0.0f); busPtrL[i] = busBufL[i].data();
+        busBufR[i].assign ((size_t) kSliceFrames, 0.0f); busPtrR[i] = busBufR[i].data();
+    }
+    packetizer.reset();
     mixer.reset();                              // first block jumps to the fader positions instead of fading in
 
     playout.reset();
@@ -370,22 +396,22 @@ void NetworkEngine::audioDeviceIOCallbackWithContext (const float* const* in, in
             captureInUse[(size_t) s].store (true, std::memory_order_seq_cst);
             if (captureActive[(size_t) s].load (std::memory_order_seq_cst))
             {
-                if (! anyApp) { std::fill (appBuf.begin(), appBuf.begin() + (size_t) n * (size_t) kAppStrips, 0.0f); anyApp = true; }
+                if (! anyApp) { std::fill (appBuf.begin(), appBuf.begin() + (size_t) n * (size_t) (kAppSlots * 2), 0.0f); anyApp = true; }
                 captureStreams[(size_t) s]->process (capTmp.data(), n);
                 for (int i = 0; i < n; ++i)
                 {
-                    appBuf[(size_t) i * (size_t) kAppStrips + (size_t) s * 2]     = capTmp[(size_t) i * 2];
-                    appBuf[(size_t) i * (size_t) kAppStrips + (size_t) s * 2 + 1] = capTmp[(size_t) i * 2 + 1];
+                    appBuf[(size_t) i * (size_t) (kAppSlots * 2) + (size_t) s * 2]     = capTmp[(size_t) i * 2];
+                    appBuf[(size_t) i * (size_t) (kAppSlots * 2) + (size_t) s * 2 + 1] = capTmp[(size_t) i * 2 + 1];
                 }
             }
             captureInUse[(size_t) s].store (false, std::memory_order_seq_cst);
         }
-        if (anyApp) appIn = { appBuf.data(), kAppStrips };
+        if (anyApp) appIn = { appBuf.data(), kAppSlots * 2 };
 
         MixerCore::Input devIn;
         if (numIn > 0 && in != nullptr)
         {
-            const int ch = std::min (numIn, kInputStrips);
+            const int ch = std::min (numIn, kMaxDeviceInputs);
             for (int c = 0; c < ch; ++c)
             {
                 if (in[c] != nullptr)
@@ -396,16 +422,41 @@ void NetworkEngine::audioDeviceIOCallbackWithContext (const float* const* in, in
             devIn = { devBuf.data(), ch };
         }
 
+        MixerCore::Output mo;
+        mo.masterL = mixL.data(); mo.masterR = mixR.data();
+        mo.busL = busPtrL.data(); mo.busR = busPtrR.data();
         MixerCore::Routing routing;
-        mixer.process (netIn, appIn, devIn, n, mixL.data(), mixR.data(), directPtrs.data(), &routing);
+        mixer.process (netIn, appIn, devIn, n, mo, &routing);
 
         for (int i = 0; i < n; ++i)
         {
             pkL = std::max (pkL, std::abs (mixL[(size_t) i]));
             pkR = std::max (pkR, std::abs (mixR[(size_t) i]));
         }
-        if (routeToDevice (mixL.data(), mixR.data(), routing.masterFirst, directPtrs.data(), routing.directCh.data(),
-                           kMixerStrips, n, out, numOut, done))
+
+        // Each stereo output goes to its destination: device channels (Audio Out) or a network stream (Net Out).
+        std::array<StereoOut, kBuses + 1> toDevice;
+        int numToDevice = 0;
+        int drops = 0;
+        auto sendNet = [&] (int stream, const float* l, const float* r)
+        {
+            if (netDestSet[(size_t) stream].load (std::memory_order_relaxed)) drops += packetizer.push (stream, l, r, n);
+            else packetizer.discard (stream);
+        };
+
+        if (routing.masterType == OutType::audio) { toDevice[(size_t) numToDevice++] = { mixL.data(), mixR.data(), routing.masterFirst }; packetizer.discard (0); }
+        else sendNet (0, mixL.data(), mixR.data());
+
+        for (int b = 0; b < kBuses; ++b)
+        {
+            const auto k = (size_t) b;
+            if (! routing.busActive[k]) { packetizer.discard (b + 1); continue; }
+            if (routing.busType[k] == OutType::audio) { toDevice[(size_t) numToDevice++] = { busPtrL[k], busPtrR[k], routing.busFirst[k] }; packetizer.discard (b + 1); }
+            else sendNet (b + 1, busPtrL[k], busPtrR[k]);
+        }
+        if (drops > 0) pubNetDrops.fetch_add ((uint64_t) drops, std::memory_order_relaxed);
+
+        if (routeToDevice (toDevice.data(), numToDevice, n, out, numOut, done))
             mixer.noteClip();
         done += n;
     }

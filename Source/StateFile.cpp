@@ -32,6 +32,177 @@ static bool readBool (const juce::var& v, bool& out)
     return true;
 }
 
+static const char* sourceName (SourceType t)
+{
+    switch (t) { case SourceType::net: return "net"; case SourceType::app: return "app"; case SourceType::input: return "input"; default: return "off"; }
+}
+
+static bool readSourceType (const juce::var& v, SourceType& out)
+{
+    if (! v.isString()) return false;
+    const auto n = v.toString();
+    if (n == "off") out = SourceType::off; else if (n == "net") out = SourceType::net;
+    else if (n == "app") out = SourceType::app; else if (n == "input") out = SourceType::input;
+    else return false;
+    return true;
+}
+
+static bool readOutType (const juce::var& v, OutType& out)
+{
+    if (! v.isString()) return false;
+    const auto n = v.toString();
+    if (n == "audio") out = OutType::audio; else if (n == "net") out = OutType::net; else return false;
+    return true;
+}
+
+static juce::var destToVar (const NetDest& d)
+{
+    auto o = std::make_unique<juce::DynamicObject>();
+    o->setProperty ("host", juce::String (d.host));
+    o->setProperty ("port", d.port);
+    return juce::var (o.release());
+}
+
+static void destFromVar (const juce::var& v, NetDest& d)
+{
+    if (! v.isObject()) return;
+    const auto host = v.getProperty ("host", {});
+    if (host.isString() && isValidHost (host.toString().toStdString())) d.host = host.toString().toStdString();
+    int32_t port;
+    if (readInt32 (v.getProperty ("port", {}), port) && port >= 1 && port <= 65535) d.port = port;
+}
+
+static constexpr int kMixerLayout = 2;       // v1 mixer files had 24 mono strips; they are not migrated (defaults load instead)
+
+juce::var mixerToVar (const MixerSettings& in)
+{
+    MixerSettings m = in;
+    m.sanitize();                                  // never write a value the reader would reject
+    auto mo = std::make_unique<juce::DynamicObject>();
+    mo->setProperty ("layout", kMixerLayout);
+    mo->setProperty ("masterDb", (double) m.masterDb);
+    mo->setProperty ("masterMute", m.masterMute);
+    mo->setProperty ("masterType", m.masterType == OutType::net ? "net" : "audio");
+    mo->setProperty ("masterOut", m.masterOut);
+    mo->setProperty ("masterDest", destToVar (m.masterDest));
+
+    juce::Array<juce::var> strips;
+    for (const auto& s : m.strips)
+    {
+        auto o = std::make_unique<juce::DynamicObject>();
+        o->setProperty ("source", sourceName (s.src.type));
+        o->setProperty ("index", s.src.index);
+        o->setProperty ("gainDb", (double) s.gainDb);
+        o->setProperty ("balance", (double) s.balance);
+        o->setProperty ("mute", s.mute);
+        o->setProperty ("solo", s.solo);
+        o->setProperty ("out", s.out);
+        o->setProperty ("name", juce::String::fromUTF8 (s.name.c_str()));
+        strips.add (juce::var (o.release()));
+    }
+    mo->setProperty ("strips", strips);
+
+    juce::Array<juce::var> buses;
+    for (const auto& b : m.buses)
+    {
+        auto o = std::make_unique<juce::DynamicObject>();
+        o->setProperty ("gainDb", (double) b.gainDb);
+        o->setProperty ("mute", b.mute);
+        o->setProperty ("type", b.type == OutType::net ? "net" : "audio");
+        o->setProperty ("outFirst", b.outFirst);
+        o->setProperty ("dest", destToVar (b.dest));
+        o->setProperty ("name", juce::String::fromUTF8 (b.name.c_str()));
+        buses.add (juce::var (o.release()));
+    }
+    mo->setProperty ("buses", buses);
+
+    juce::Array<juce::var> apps;
+    for (const auto& a : m.apps)
+    {
+        auto o = std::make_unique<juce::DynamicObject>();
+        o->setProperty ("bundleId", juce::String (a.bundleId));
+        o->setProperty ("name", juce::String::fromUTF8 (a.name.c_str()));
+        o->setProperty ("silenceOriginal", a.silenceOriginal);
+        apps.add (juce::var (o.release()));
+    }
+    mo->setProperty ("apps", apps);
+    return juce::var (mo.release());
+}
+
+bool mixerFromVar (const juce::var& mx, MixerSettings& out)
+{
+    out = MixerSettings();
+    int32_t layout = 0;
+    if (! mx.isObject() || ! readInt32 (mx.getProperty ("layout", {}), layout) || layout != kMixerLayout) return false;
+
+    auto num = [] (const juce::var& v, float& dest, float (*clamp) (float))
+    {
+        double d;
+        if (readFiniteNumber (v, d)) dest = clamp ((float) std::clamp (d, -1000.0, 1000.0));
+    };
+    bool b = false;
+    int32_t i32 = 0;
+
+    num (mx.getProperty ("masterDb", {}), out.masterDb, clampGainDb);
+    if (readBool (mx.getProperty ("masterMute", {}), b)) out.masterMute = b;
+    readOutType (mx.getProperty ("masterType", {}), out.masterType);
+    if (readInt32 (mx.getProperty ("masterOut", {}), i32)) out.masterOut = clampOutFirst (i32);
+    destFromVar (mx.getProperty ("masterDest", {}), out.masterDest);
+
+    if (auto* apps = mx.getProperty ("apps", {}).getArray())
+        for (int i = 0; i < (int) apps->size() && i < kAppSlots; ++i)
+        {
+            const auto& e = apps->getReference (i);
+            const auto id = e.getProperty ("bundleId", {});
+            if (! id.isString() || ! isValidBundleId (id.toString().toStdString())) continue;   // bad slot: stays empty
+            auto& a = out.apps[(size_t) i];
+            a.bundleId = id.toString().toStdString();
+            const auto name = e.getProperty ("name", {});
+            if (name.isString()) a.name = sanitizeText (name.toString().toStdString(), kMaxAppNameLength);
+            if (readBool (e.getProperty ("silenceOriginal", {}), b)) a.silenceOriginal = b;
+        }
+
+    if (auto* arr = mx.getProperty ("strips", {}).getArray())
+        for (int i = 0; i < (int) arr->size() && i < kStrips; ++i)             // extra entries are ignored
+        {
+            const auto& e = arr->getReference (i);
+            if (! e.isObject()) continue;
+            auto& strip = out.strips[(size_t) i];
+            SourceType t;
+            if (readSourceType (e.getProperty ("source", {}), t))
+            {
+                strip.src.type = t;
+                strip.src.index = readInt32 (e.getProperty ("index", {}), i32) ? i32 : 0;
+                strip.src.sanitize();
+            }
+            num (e.getProperty ("gainDb", {}), strip.gainDb, clampGainDb);
+            num (e.getProperty ("balance", {}), strip.balance, clampBalance);
+            if (readBool (e.getProperty ("mute", {}), b)) strip.mute = b;
+            if (readBool (e.getProperty ("solo", {}), b)) strip.solo = b;
+            if (readInt32 (e.getProperty ("out", {}), i32)) strip.out = clampStripOut (i32);
+            const auto name = e.getProperty ("name", {});
+            if (name.isString()) strip.name = sanitizeStripName (name.toString().toStdString());
+        }
+
+    if (auto* arr = mx.getProperty ("buses", {}).getArray())
+        for (int i = 0; i < (int) arr->size() && i < kBuses; ++i)
+        {
+            const auto& e = arr->getReference (i);
+            if (! e.isObject()) continue;
+            auto& bus = out.buses[(size_t) i];
+            num (e.getProperty ("gainDb", {}), bus.gainDb, clampGainDb);
+            if (readBool (e.getProperty ("mute", {}), b)) bus.mute = b;
+            readOutType (e.getProperty ("type", {}), bus.type);
+            if (readInt32 (e.getProperty ("outFirst", {}), i32)) bus.outFirst = clampOutFirst (i32);
+            destFromVar (e.getProperty ("dest", {}), bus.dest);
+            const auto name = e.getProperty ("name", {});
+            if (name.isString()) bus.name = sanitizeStripName (name.toString().toStdString());
+        }
+
+    out.sanitize();
+    return true;
+}
+
 juce::String toJson (const PatchbayState& st)
 {
     auto root = std::make_unique<juce::DynamicObject>();
@@ -78,38 +249,7 @@ juce::String toJson (const PatchbayState& st)
     mn->setProperty ("hosts", hosts);
     root->setProperty ("midiNet", juce::var (mn.release()));
 
-    {
-        MixerSettings m = st.mixer;
-        m.sanitize();                                  // never write a value the reader would reject
-        auto mo = std::make_unique<juce::DynamicObject>();
-        mo->setProperty ("masterDb", (double) m.masterDb);
-        mo->setProperty ("masterMute", m.masterMute);
-        juce::Array<juce::var> strips;
-        for (const auto& s : m.strips)
-        {
-            auto o = std::make_unique<juce::DynamicObject>();
-            o->setProperty ("gainDb", (double) s.gainDb);
-            o->setProperty ("pan", (double) s.pan);
-            o->setProperty ("mute", s.mute);
-            o->setProperty ("solo", s.solo);
-            o->setProperty ("directOut", s.directOut);
-            o->setProperty ("name", juce::String::fromUTF8 (s.name.c_str()));
-            strips.add (juce::var (o.release()));
-        }
-        mo->setProperty ("strips", strips);
-        mo->setProperty ("masterOut", m.masterOut);
-        juce::Array<juce::var> apps;
-        for (const auto& a : m.apps)
-        {
-            auto o = std::make_unique<juce::DynamicObject>();
-            o->setProperty ("bundleId", juce::String (a.bundleId));
-            o->setProperty ("name", juce::String::fromUTF8 (a.name.c_str()));
-            o->setProperty ("silenceOriginal", a.silenceOriginal);
-            apps.add (juce::var (o.release()));
-        }
-        mo->setProperty ("apps", apps);
-        root->setProperty ("mixer", juce::var (mo.release()));
-    }
+    root->setProperty ("mixer", mixerToVar (st.mixer));
 
     return juce::JSON::toString (juce::var (root.release()));
 }
@@ -175,42 +315,7 @@ PatchbayState fromJson (const juce::String& text)
         st.midiNet.hosts = normaliseHosts (raw);          // same validation whether the file is ours or hand-edited
     }
 
-    const auto mx = root.getProperty ("mixer", {});
-    if (mx.isObject())
-    {
-        double d = 0.0;
-        bool b = false;
-        if (readFiniteNumber (mx.getProperty ("masterDb", {}), d)) st.mixer.masterDb = clampGainDb ((float) std::clamp (d, -1000.0, 1000.0));
-        if (readBool (mx.getProperty ("masterMute", {}), b)) st.mixer.masterMute = b;
-        int32_t mo;
-        if (readInt32 (mx.getProperty ("masterOut", {}), mo)) st.mixer.masterOut = clampMasterOut (mo);
-        if (auto* apps = mx.getProperty ("apps", {}).getArray())
-            for (int i = 0; i < (int) apps->size() && i < kAppSlots; ++i)
-            {
-                const auto& e = apps->getReference (i);
-                const auto id = e.getProperty ("bundleId", {});
-                if (! id.isString() || ! isValidBundleId (id.toString().toStdString())) continue;   // bad slot: stays empty
-                auto& a = st.mixer.apps[(size_t) i];
-                a.bundleId = id.toString().toStdString();
-                const auto name = e.getProperty ("name", {});
-                if (name.isString()) a.name = sanitizeText (name.toString().toStdString(), kMaxAppNameLength);
-                if (readBool (e.getProperty ("silenceOriginal", {}), b)) a.silenceOriginal = b;
-            }
-        if (auto* arr = mx.getProperty ("strips", {}).getArray())
-            for (int i = 0; i < (int) arr->size() && i < kMixerStrips; ++i)      // extra entries are ignored
-            {
-                const auto& e = arr->getReference (i);
-                auto& strip = st.mixer.strips[(size_t) i];
-                if (readFiniteNumber (e.getProperty ("gainDb", {}), d)) strip.gainDb = clampGainDb ((float) std::clamp (d, -1000.0, 1000.0));
-                if (readFiniteNumber (e.getProperty ("pan", {}), d)) strip.pan = clampPan ((float) std::clamp (d, -1000.0, 1000.0));
-                if (readBool (e.getProperty ("mute", {}), b)) strip.mute = b;
-                if (readBool (e.getProperty ("solo", {}), b)) strip.solo = b;
-                int32_t di;
-                if (readInt32 (e.getProperty ("directOut", {}), di)) strip.directOut = clampDirectOut (di);
-                const auto name = e.getProperty ("name", {});
-                if (name.isString()) strip.name = sanitizeStripName (name.toString().toStdString());
-            }
-    }
+    mixerFromVar (root.getProperty ("mixer", {}), st.mixer);
 
     return st;
 }

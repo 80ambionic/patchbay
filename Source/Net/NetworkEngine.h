@@ -9,15 +9,19 @@
 #include "../Capture/CaptureStream.h"
 #include "../Mixer/DeviceRouter.h"
 #include "../Mixer/MixerCore.h"
+#include "NetOut.h"
 #include "UdpReceiver.h"
+#include "UdpSender.h"
 #include "../StateFile.h"
 
 namespace pb::net
 {
-/** The audio engine: owns the output device and the audio callback, and feeds the mixer from two kinds of source.
+/** The audio engine: owns the output device and the audio callback, and feeds the mixer from three kinds of source.
       network:  UDP thread (UdpReceiver) --SpscQueue--> NetworkPlayout ------------\
-      app:      Core Audio tap thread --> CaptureStream (resample + drift fix) ----+--> MixerCore --> DeviceRouter --> outputs
-    The device is open while the network is listening OR any app capture slot is on; closing the last one releases it.
+      app:      Core Audio tap thread --> CaptureStream (resample + drift fix) ----+--> MixerCore --+--> DeviceRouter --> device outputs
+      input:    the audio input device's channels ---------------------------------/               \--> NetPacketizer --> UdpSender --> network
+    The device is open while the network is listening OR any app capture slot is on OR device inputs are on; closing the
+    last one releases it. The master and each output bus end at device outputs ("Audio Out") or at a UDP stream ("Net Out").
     Lifecycle calls (start/stop/setBufferPackets/snapshot) are message-thread only; the audio callback only
     touches atomics shared with them, never locks or allocates. */
 class NetworkEngine : private juce::AudioIODeviceCallback
@@ -45,8 +49,8 @@ public:
     int  getNumOutputs() const noexcept { return pubNumOutputs.load(); }      // output channels the open device provides (0 = closed)
 
     // ---- audio input device (opt-in: opening inputs is what triggers the microphone permission prompt) ----------------
-    /** Opens the default audio input device's first kInputStrips channels (or closes inputs) and feeds them to strips 17-24.
-        Never called automatically. Choose a different input in the Audio device dialog. */
+    /** Opens the default audio input device's first kMaxDeviceInputs channels (or closes inputs); strips set to "Input"
+        pick stereo pairs from them. Never called automatically. Choose a different input in the Audio device dialog. */
     bool setDeviceInputsEnabled (bool on, juce::String& error);
     bool areDeviceInputsEnabled() const noexcept { return inputsOn; }
     int  getNumInputs() const noexcept { return pubNumInputs.load(); }       // input channels the open device provides
@@ -71,6 +75,13 @@ public:
 
     /** The mixer stage. Its setters are safe from the message thread while audio runs. */
     MixerCore& getMixer() noexcept { return mixer; }
+
+    // ---- Net Out ---------------------------------------------------------------------------------------------------
+    /** Where a Net Out stream goes: stream 0 is the master, stream n is output bus n. Empty host = nothing is sent. */
+    void setNetOutDestination (int stream, const std::string& host, int port);
+
+    struct NetOutStats { uint64_t sent = 0, failed = 0, unrouted = 0, queueDrops = 0; bool running = false; };
+    NetOutStats getNetOutStats() const;
     juce::String describeDevice() const;
 
 private:
@@ -105,8 +116,15 @@ private:
     // Owned by the audio device lifecycle: created in audioDeviceAboutToStart, destroyed in audioDeviceStopped.
     std::unique_ptr<NetworkPlayout> playout;
     std::vector<float> scratch, mixL, mixR, appBuf, capTmp, devBuf;
-    std::array<std::vector<float>, kMixerStrips> directBuf;
-    std::array<float*, kMixerStrips> directPtrs {};
+    std::array<std::vector<float>, kBuses> busBufL, busBufR;
+    std::array<float*, kBuses> busPtrL {}, busPtrR {};
+
+    // Net Out. The queue and packetizer are touched by the audio thread only (the sender thread is the queue's consumer).
+    net::OutQueue netQueue;
+    net::NetPacketizer packetizer { netQueue };
+    net::UdpSender sender { netQueue };
+    std::array<std::atomic<bool>, net::kNetOutStreams> netDestSet {};
+    std::atomic<uint64_t> pubNetDrops { 0 };
     int appliedTarget = 4;
 
     // Receiver counters keep running across sessions; we report deltas since start().

@@ -1,25 +1,28 @@
 #pragma once
 // Mixer DSP core. Pure C++ (no JUCE), allocation-free and lock-free in process(), unit-tested.
 //
-//   input channel i -> strip i: fader gain -> mute/solo -> constant-power pan -> stereo sum -> master gain -> clamp
-//                                                      \-> or, if the strip has a direct out: post-fader mono -> device channel
+//   source -> strip (stereo): fader -> mute/solo -> balance -> master bus  or  output bus n
+//   output bus n: fader -> mute -> clamp -> its destination (device output pair or network stream)
+//   master:       fader -> mute -> clamp -> its destination
 //
-// Inputs come in two banks of interleaved audio:
-//   network bank -> strips 1-8   (a 1-channel stream feeds strips 1 and 2 so a mono source still plays on both sides)
-//   app bank     -> strips 9-16  (strip 9 + k takes app channel k; no mono duplication - app captures are always stereo)
-//   input bank   -> strips 17-24 (strip 17 + k takes audio-input-device channel k)
+// Sources come in three banks of interleaved audio. A strip picks one stereo pair from one bank:
+//   net   bank: the network stream, 1-8 channels  -> pairs 0-3 (channels 1-2, 3-4, ...)
+//   app   bank: the four app-capture slots, always stereo -> pair k = slot k
+//   input bank: the audio input device, up to 64 channels -> pairs 0-31
+// A pair whose left channel does not exist is silent. A pair with only a left channel (a mono stream, a mono microphone,
+// an odd channel count) plays that channel on both sides.
 //
 // Rules:
-//   - Strips without an input channel are silent. Input channels beyond a bank's strips are ignored.
-//   - If any strip is soloed, strips that are not soloed are silent. Mute always wins over solo.
-//   - Pan law: constant power (-3 dB at centre).
-//   - A strip with a direct out bypasses pan and master and is written (post-fader, mute/solo applied) to that strip's
-//     buffer in `direct`; the chosen device channel is reported through `routing`. Direct outs are ignored when the caller
-//     passes no `direct` buffer for that strip, and then the strip plays through the master as usual.
+//   - If any strip is soloed, strips that are not soloed are silent. Mute always wins over solo. Solo spans all banks.
+//   - Balance law: unity at the centre; turning it away from a side attenuates that side with a cos law
+//     (-3 dB at the quarter point, silent at the end). The other side is untouched.
+//   - A strip whose output is a bus plays on that bus; if the caller gives no buffers for that bus the strip plays on the
+//     master. A bus is "active" for a block when at least one strip is routed to it; inactive buses are not written.
 //   - Gain changes ramp linearly across the block, so moving a fader or switching a route never clicks. The first block
-//     after reset() jumps straight to the targets.
-//   - Non-finite input samples are replaced by 0; the master output is clamped to +-1.
-//   - Strip meters are post-fader, pre-mute, pre-pan.
+//     after reset() jumps straight to the targets. When a strip's output changes, it fades out of the old destination and
+//     into the new one over one block.
+//   - Non-finite input samples are replaced by 0; master and bus outputs are clamped to +-1 (the clip flag is raised).
+//   - Strip meters are post-fader, pre-mute, pre-balance; bus and master meters are post-everything.
 //
 // Threading: set*() may be called from any thread while process() runs on the audio thread (atomics only).
 #include <algorithm>
@@ -35,18 +38,31 @@ class MixerCore
 public:
     struct Peaks
     {
-        std::array<float, kMixerStrips> strip {};
+        std::array<float, kStrips> stripL {}, stripR {};
+        std::array<float, kBuses> busL {}, busR {};
         float masterL = 0.0f, masterR = 0.0f;
         bool clipped = false;
     };
 
     struct Input { const float* data = nullptr; int channels = 0; };   // interleaved
 
-    /** What process() decided for this block; the device router needs exactly this, not a fresh read of the atomics. */
+    /** Where process() writes. busL/busR (optional) are kBuses buffers each; only active buses are written. */
+    struct Output
+    {
+        float* masterL = nullptr;
+        float* masterR = nullptr;
+        float* const* busL = nullptr;
+        float* const* busR = nullptr;
+    };
+
+    /** What process() decided for this block; the engine needs exactly this, not a fresh read of the atomics. */
     struct Routing
     {
-        int masterFirst = 1;                                   // 1-based device channel of master L (R is the next one)
-        std::array<int, kMixerStrips> directCh {};             // 0 = strip not written to `direct` this block
+        OutType masterType = OutType::audio;
+        int masterFirst = 1;                                   // Audio Out: 1-based device channel of master L
+        std::array<bool, kBuses> busActive {};
+        std::array<OutType, kBuses> busType {};
+        std::array<int, kBuses> busFirst {};
     };
 
     MixerCore() { setSettings (MixerSettings()); }
@@ -56,31 +72,61 @@ public:
     {
         MixerSettings s = in;
         s.sanitize();
-        for (int i = 0; i < kMixerStrips; ++i)
+        for (int i = 0; i < kStrips; ++i)
         {
             const auto& st = s.strips[(size_t) i];
-            setStripGainDb (i, st.gainDb); setStripPan (i, st.pan); setStripMute (i, st.mute);
-            setStripSolo (i, st.solo); setStripDirectOut (i, st.directOut);
+            setStripSource (i, st.src); setStripGainDb (i, st.gainDb); setStripBalance (i, st.balance);
+            setStripMute (i, st.mute); setStripSolo (i, st.solo); setStripOut (i, st.out);
+        }
+        for (int b = 0; b < kBuses; ++b)
+        {
+            const auto& bs = s.buses[(size_t) b];
+            setBusGainDb (b, bs.gainDb); setBusMute (b, bs.mute); setBusType (b, bs.type); setBusOutFirst (b, bs.outFirst);
         }
         setMasterDb (s.masterDb);
         setMasterMute (s.masterMute);
+        setMasterType (s.masterType);
         setMasterOut (s.masterOut);
     }
 
-    void setStripGainDb (int i, float db) noexcept { if (valid (i)) strip[(size_t) i].gainDb.store (clampGainDb (db), std::memory_order_relaxed); }
-    void setStripPan    (int i, float p)  noexcept { if (valid (i)) strip[(size_t) i].pan.store (clampPan (p), std::memory_order_relaxed); }
-    void setStripMute   (int i, bool m)   noexcept { if (valid (i)) strip[(size_t) i].mute.store (m, std::memory_order_relaxed); }
-    void setStripSolo   (int i, bool s)   noexcept { if (valid (i)) strip[(size_t) i].solo.store (s, std::memory_order_relaxed); }
-    void setStripDirectOut (int i, int ch) noexcept { if (valid (i)) strip[(size_t) i].directOut.store (clampDirectOut (ch), std::memory_order_relaxed); }
+    void setStripSource (int i, Source src) noexcept
+    {
+        if (! validStrip (i)) return;
+        src.sanitize();
+        auto& s = strip[(size_t) i];
+        s.srcType.store ((int) src.type, std::memory_order_relaxed);
+        s.srcIndex.store (src.index, std::memory_order_relaxed);
+    }
+    void setStripGainDb (int i, float db) noexcept { if (validStrip (i)) strip[(size_t) i].gainDb.store (clampGainDb (db), std::memory_order_relaxed); }
+    void setStripBalance (int i, float b) noexcept { if (validStrip (i)) strip[(size_t) i].balance.store (clampBalance (b), std::memory_order_relaxed); }
+    void setStripMute   (int i, bool m)   noexcept { if (validStrip (i)) strip[(size_t) i].mute.store (m, std::memory_order_relaxed); }
+    void setStripSolo   (int i, bool s)   noexcept { if (validStrip (i)) strip[(size_t) i].solo.store (s, std::memory_order_relaxed); }
+    void setStripOut    (int i, int out)  noexcept { if (validStrip (i)) strip[(size_t) i].out.store (clampStripOut (out), std::memory_order_relaxed); }
+
+    void setBusGainDb  (int b, float db) noexcept { if (validBus (b)) bus[(size_t) b].gainDb.store (clampGainDb (db), std::memory_order_relaxed); }
+    void setBusMute    (int b, bool m)   noexcept { if (validBus (b)) bus[(size_t) b].mute.store (m, std::memory_order_relaxed); }
+    void setBusType    (int b, OutType t) noexcept { if (validBus (b)) bus[(size_t) b].type.store (t == OutType::net ? 1 : 0, std::memory_order_relaxed); }
+    void setBusOutFirst (int b, int first) noexcept { if (validBus (b)) bus[(size_t) b].outFirst.store (clampOutFirst (first), std::memory_order_relaxed); }
+
     void setMasterDb (float db) noexcept { masterDb.store (clampGainDb (db), std::memory_order_relaxed); }
     void setMasterMute (bool m) noexcept { masterMute.store (m, std::memory_order_relaxed); }
-    void setMasterOut (int firstCh) noexcept { masterOut.store (clampMasterOut (firstCh), std::memory_order_relaxed); }
+    void setMasterType (OutType t) noexcept { masterType.store (t == OutType::net ? 1 : 0, std::memory_order_relaxed); }
+    void setMasterOut (int firstCh) noexcept { masterOut.store (clampOutFirst (firstCh), std::memory_order_relaxed); }
 
     /** Peaks since the previous call (the call resets them). Call from the UI thread. */
     Peaks takePeaks() noexcept
     {
         Peaks p;
-        for (int i = 0; i < kMixerStrips; ++i) p.strip[(size_t) i] = stripPeak[(size_t) i].exchange (0.0f, std::memory_order_relaxed);
+        for (int i = 0; i < kStrips; ++i)
+        {
+            p.stripL[(size_t) i] = stripPeakL[(size_t) i].exchange (0.0f, std::memory_order_relaxed);
+            p.stripR[(size_t) i] = stripPeakR[(size_t) i].exchange (0.0f, std::memory_order_relaxed);
+        }
+        for (int b = 0; b < kBuses; ++b)
+        {
+            p.busL[(size_t) b] = busPeakL[(size_t) b].exchange (0.0f, std::memory_order_relaxed);
+            p.busR[(size_t) b] = busPeakR[(size_t) b].exchange (0.0f, std::memory_order_relaxed);
+        }
         p.masterL = peakL.exchange (0.0f, std::memory_order_relaxed);
         p.masterR = peakR.exchange (0.0f, std::memory_order_relaxed);
         p.clipped = clipped.exchange (false, std::memory_order_relaxed);
@@ -91,111 +137,191 @@ public:
     /** Next block jumps to the current targets instead of ramping (call when the device restarts). */
     void reset() noexcept { snapped = false; }
 
-    /** Network bank only (strips 1-8); everything plays through the master. */
-    void process (const float* in, int inChannels, int frames, float* outL, float* outR) noexcept
+    /** masterL/masterR are overwritten with `frames` samples. Active buses are too (bus buffers of inactive buses are
+        left untouched). */
+    void process (Input net, Input app, Input dev, int frames, const Output& out, Routing* routing) noexcept
     {
-        process (Input { in, inChannels }, Input {}, frames, outL, outR, nullptr, nullptr);
-    }
+        if (frames <= 0 || out.masterL == nullptr || out.masterR == nullptr) return;
+        std::fill (out.masterL, out.masterL + frames, 0.0f);
+        std::fill (out.masterR, out.masterR + frames, 0.0f);
 
-    /** outL/outR are overwritten with `frames` samples. `direct` (optional) is kMixerStrips buffers of `frames` samples;
-        only the ones reported in routing->directCh are written. */
-    void process (Input net, Input app, int frames, float* outL, float* outR,
-                  float* const* direct, Routing* routing) noexcept
-    {
-        process (net, app, Input {}, frames, outL, outR, direct, routing);
-    }
-
-    /** All three banks. */
-    void process (Input net, Input app, Input dev, int frames, float* outL, float* outR,
-                  float* const* direct, Routing* routing) noexcept
-    {
-        if (frames <= 0) return;
-        std::fill (outL, outL + frames, 0.0f);
-        std::fill (outR, outR + frames, 0.0f);
+        const bool haveBuses = out.busL != nullptr && out.busR != nullptr;
+        auto busBuffers = [&] (int b) { return haveBuses && out.busL[b] != nullptr && out.busR[b] != nullptr; };
 
         // ---- targets for this block
         bool anySolo = false;
         for (auto& s : strip) anySolo = anySolo || s.solo.load (std::memory_order_relaxed);
 
-        std::array<float, kMixerStrips> faderLin {}, tgtL {}, tgtR {}, tgtD {};
-        std::array<int, kMixerStrips> dch {};
-        for (int i = 0; i < kMixerStrips; ++i)
+        std::array<float, kStrips> faderLin {}, tgtL {}, tgtR {};
+        std::array<int, kStrips> dest {};                       // 0 = master, n = bus n
+        std::array<SourceType, kStrips> stype {};
+        std::array<int, kStrips> sindex {};
+        std::array<bool, kBuses> active {};
+        for (int i = 0; i < kStrips; ++i)
         {
-            auto& s = strip[(size_t) i];
-            const size_t k = (size_t) i;
+            const auto k = (size_t) i;
+            auto& s = strip[k];
             const float g = gainDbToLinear (s.gainDb.load (std::memory_order_relaxed));
             const bool audible = ! s.mute.load (std::memory_order_relaxed)
                                  && (! anySolo || s.solo.load (std::memory_order_relaxed));
-            const int want = s.directOut.load (std::memory_order_relaxed);
-            const bool useDirect = want > 0 && direct != nullptr && direct[i] != nullptr;
-            const float angle = (s.pan.load (std::memory_order_relaxed) + 1.0f) * (kPi * 0.25f);   // 0 .. pi/2
+            const float bal = s.balance.load (std::memory_order_relaxed);
+
+            int d = s.out.load (std::memory_order_relaxed);
+            if (d > 0 && ! busBuffers (d - 1)) d = 0;           // no buffers for that bus: play on the master
+            dest[k] = d;
+            if (d > 0) active[(size_t) (d - 1)] = true;
+
+            Source src { (SourceType) s.srcType.load (std::memory_order_relaxed), s.srcIndex.load (std::memory_order_relaxed) };
+            src.sanitize();
+            stype[k] = src.type; sindex[k] = src.index;
 
             faderLin[k] = g;
-            dch[k] = useDirect ? want : 0;
-            tgtD[k] = useDirect && audible ? g : 0.0f;
-            tgtL[k] = ! useDirect && audible ? g * std::cos (angle) : 0.0f;
-            tgtR[k] = ! useDirect && audible ? g * std::sin (angle) : 0.0f;
+            tgtL[k] = audible ? g * (bal > 0.0f ? std::cos (bal * kHalfPi) : 1.0f) : 0.0f;
+            tgtR[k] = audible ? g * (bal < 0.0f ? std::cos (-bal * kHalfPi) : 1.0f) : 0.0f;
+        }
+
+        std::array<float, kBuses> tgtBus {};
+        for (int b = 0; b < kBuses; ++b)
+        {
+            auto& bs = bus[(size_t) b];
+            tgtBus[(size_t) b] = bs.mute.load (std::memory_order_relaxed) ? 0.0f : gainDbToLinear (bs.gainDb.load (std::memory_order_relaxed));
         }
         const float tgtMaster = masterMute.load (std::memory_order_relaxed)
                                     ? 0.0f : gainDbToLinear (masterDb.load (std::memory_order_relaxed));
 
-        if (routing != nullptr)
-        {
-            routing->masterFirst = masterOut.load (std::memory_order_relaxed);
-            routing->directCh = dch;
-        }
-
         if (! snapped)
         {
-            curL = tgtL; curR = tgtR; curD = tgtD; curMaster = tgtMaster; snapped = true;
+            curL = tgtL; curR = tgtR; curBus = tgtBus; curMaster = tgtMaster; prevDest = dest; snapped = true;
         }
 
-        // ---- mix
-        const float invFrames = 1.0f / (float) frames;
-        for (int i = 0; i < kMixerStrips; ++i)
+        // A bus a strip just left stays active for this block, so the strip can fade out of it.
+        std::array<bool, kStrips> fadeOut {};
+        for (int i = 0; i < kStrips; ++i)
         {
-            const size_t k = (size_t) i;
-            const bool isNet = i < kNetworkStrips;
-            const Input& bank = isNet ? net : (i < kNetworkStrips + kAppStrips ? app : dev);
-            const int local = isNet ? i : (i < kNetworkStrips + kAppStrips ? i - kNetworkStrips : i - kNetworkStrips - kAppStrips);
-            const int srcCh = (isNet && bank.channels == 1) ? (local < 2 ? 0 : -1) : (local < bank.channels ? local : -1);
+            const auto k = (size_t) i;
+            const int pd = prevDest[k];
+            if (pd != dest[k] && pd > 0 && busBuffers (pd - 1)) { fadeOut[k] = true; active[(size_t) (pd - 1)] = true; }
+        }
 
-            float* dbuf = dch[k] > 0 ? direct[i] : nullptr;
-            const float dL = (tgtL[k] - curL[k]) * invFrames, dR = (tgtR[k] - curR[k]) * invFrames, dD = (tgtD[k] - curD[k]) * invFrames;
-            float gl = curL[k], gr = curR[k], gd = curD[k];
-
-            if (srcCh >= 0 && bank.data != nullptr)
+        if (routing != nullptr)
+        {
+            routing->masterType = masterType.load (std::memory_order_relaxed) == 1 ? OutType::net : OutType::audio;
+            routing->masterFirst = masterOut.load (std::memory_order_relaxed);
+            for (int b = 0; b < kBuses; ++b)
             {
-                float peak = 0.0f;
+                const auto k = (size_t) b;
+                routing->busActive[k] = active[k];
+                routing->busType[k] = bus[k].type.load (std::memory_order_relaxed) == 1 ? OutType::net : OutType::audio;
+                routing->busFirst[k] = bus[k].outFirst.load (std::memory_order_relaxed);
+            }
+        }
+
+        for (int b = 0; b < kBuses; ++b)                         // an inactive bus has no ramp to continue
+            if (! active[(size_t) b]) curBus[(size_t) b] = tgtBus[(size_t) b];
+
+        for (int b = 0; b < kBuses; ++b)
+            if (active[(size_t) b]) { std::fill (out.busL[b], out.busL[b] + frames, 0.0f); std::fill (out.busR[b], out.busR[b] + frames, 0.0f); }
+
+        // ---- strips
+        const float invFrames = 1.0f / (float) frames;
+        for (int i = 0; i < kStrips; ++i)
+        {
+            const auto k = (size_t) i;
+            const Input& bank = stype[k] == SourceType::net ? net : (stype[k] == SourceType::app ? app : dev);
+            int cl = -1, cr = -1;
+            if (stype[k] != SourceType::off && bank.data != nullptr)
+            {
+                const int l = 2 * sindex[k];
+                if (l < bank.channels) { cl = l; cr = l + 1 < bank.channels ? l + 1 : l; }
+            }
+
+            if (cl >= 0)
+            {
+                auto dst = [&] (int d, float*& dl, float*& dr)
+                {
+                    dl = d == 0 ? out.masterL : out.busL[d - 1];
+                    dr = d == 0 ? out.masterR : out.busR[d - 1];
+                };
+                float* dl; float* dr;
+                const bool moved = prevDest[k] != dest[k];
+                const int pd = prevDest[k];
+                const bool prevOk = moved && (pd == 0 || fadeOut[k]);
+
+                float peakL = 0.0f, peakR = 0.0f;
+                // Fade in (or ramp) on the current destination.
+                dst (dest[k], dl, dr);
+                const float startL = moved ? 0.0f : curL[k], startR = moved ? 0.0f : curR[k];
+                const float dL = (tgtL[k] - startL) * invFrames, dR = (tgtR[k] - startR) * invFrames;
+                float gl = startL, gr = startR;
                 for (int n = 0; n < frames; ++n)
                 {
-                    const float x = clean (bank.data[(size_t) n * (size_t) bank.channels + (size_t) srcCh]);
-                    peak = std::max (peak, std::abs (x));
-                    gl += dL; gr += dR; gd += dD;
-                    outL[n] += x * gl;
-                    outR[n] += x * gr;
-                    if (dbuf != nullptr) dbuf[n] = x * gd;
+                    const float xl = clean (bank.data[(size_t) n * (size_t) bank.channels + (size_t) cl]);
+                    const float xr = clean (bank.data[(size_t) n * (size_t) bank.channels + (size_t) cr]);
+                    peakL = std::max (peakL, std::abs (xl)); peakR = std::max (peakR, std::abs (xr));
+                    gl += dL; gr += dR;
+                    dl[n] += xl * gl;
+                    dr[n] += xr * gr;
                 }
-                raise (stripPeak[k], peak * faderLin[k]);
-            }
-            else if (dbuf != nullptr)
-                std::fill (dbuf, dbuf + frames, 0.0f);
+                raise (stripPeakL[k], peakL * faderLin[k]);
+                raise (stripPeakR[k], peakR * faderLin[k]);
 
-            curL[k] = tgtL[k]; curR[k] = tgtR[k]; curD[k] = tgtD[k];   // land exactly on the target
+                // Fade out of the previous destination, so a route change does not click.
+                if (prevOk)
+                {
+                    float *pl, *pr;
+                    dst (pd, pl, pr);
+                    const float eL = -curL[k] * invFrames, eR = -curR[k] * invFrames;
+                    float hl = curL[k], hr = curR[k];
+                    for (int n = 0; n < frames; ++n)
+                    {
+                        const float xl = clean (bank.data[(size_t) n * (size_t) bank.channels + (size_t) cl]);
+                        const float xr = clean (bank.data[(size_t) n * (size_t) bank.channels + (size_t) cr]);
+                        hl += eL; hr += eR;
+                        pl[n] += xl * hl;
+                        pr[n] += xr * hr;
+                    }
+                }
+            }
+            curL[k] = tgtL[k]; curR[k] = tgtR[k]; prevDest[k] = dest[k];      // land exactly on the target
+        }
+
+        bool clip = false;
+
+        // ---- buses
+        for (int b = 0; b < kBuses; ++b)
+        {
+            const auto k = (size_t) b;
+            if (! active[k]) continue;
+            const float dB = (tgtBus[k] - curBus[k]) * invFrames;
+            float g = curBus[k];
+            float pl = 0.0f, pr = 0.0f;
+            float* l = out.busL[b];
+            float* r = out.busR[b];
+            for (int n = 0; n < frames; ++n)
+            {
+                g += dB;
+                float xl = l[n] * g, xr = r[n] * g;
+                if (xl > 1.0f || xl < -1.0f) { clip = true; xl = xl > 0.0f ? 1.0f : -1.0f; }
+                if (xr > 1.0f || xr < -1.0f) { clip = true; xr = xr > 0.0f ? 1.0f : -1.0f; }
+                l[n] = xl; r[n] = xr;
+                pl = std::max (pl, std::abs (xl)); pr = std::max (pr, std::abs (xr));
+            }
+            curBus[k] = tgtBus[k];
+            raise (busPeakL[k], pl);
+            raise (busPeakR[k], pr);
         }
 
         // ---- master
         const float dM = (tgtMaster - curMaster) * invFrames;
         float gm = curMaster;
         float pl = 0.0f, pr = 0.0f;
-        bool clip = false;
         for (int n = 0; n < frames; ++n)
         {
             gm += dM;
-            float l = outL[n] * gm, r = outR[n] * gm;
+            float l = out.masterL[n] * gm, r = out.masterR[n] * gm;
             if (l > 1.0f || l < -1.0f) { clip = true; l = l > 0.0f ? 1.0f : -1.0f; }
             if (r > 1.0f || r < -1.0f) { clip = true; r = r > 0.0f ? 1.0f : -1.0f; }
-            outL[n] = l; outR[n] = r;
+            out.masterL[n] = l; out.masterR[n] = r;
             pl = std::max (pl, std::abs (l)); pr = std::max (pr, std::abs (r));
         }
         curMaster = tgtMaster;
@@ -204,13 +330,14 @@ public:
         if (clip) clipped.store (true, std::memory_order_relaxed);
     }
 
-    /** Lets the engine report a clamp that happened in the device router (direct outs summing past full scale). */
+    /** Lets the engine report a clamp that happened in the device router (outputs summing past full scale). */
     void noteClip() noexcept { clipped.store (true, std::memory_order_relaxed); }
 
 private:
-    static constexpr float kPi = 3.14159265358979323846f;
+    static constexpr float kHalfPi = 1.57079632679489661923f;
 
-    static bool valid (int i) noexcept { return i >= 0 && i < kMixerStrips; }
+    static bool validStrip (int i) noexcept { return i >= 0 && i < kStrips; }
+    static bool validBus (int b) noexcept { return b >= 0 && b < kBuses; }
     static float clean (float x) noexcept { return std::isfinite (x) ? x : 0.0f; }
     static void raise (std::atomic<float>& a, float v) noexcept
     {
@@ -220,24 +347,34 @@ private:
 
     struct Strip
     {
-        std::atomic<float> gainDb { 0.0f }, pan { 0.0f };
+        std::atomic<int> srcType { 0 }, srcIndex { 0 }, out { 0 };
+        std::atomic<float> gainDb { 0.0f }, balance { 0.0f };
         std::atomic<bool> mute { false }, solo { false };
-        std::atomic<int> directOut { 0 };
+    };
+    struct Bus
+    {
+        std::atomic<float> gainDb { 0.0f };
+        std::atomic<bool> mute { false };
+        std::atomic<int> type { 0 }, outFirst { 1 };
     };
     static_assert (std::atomic<float>::is_always_lock_free && std::atomic<bool>::is_always_lock_free
                    && std::atomic<int>::is_always_lock_free, "audio-thread atomics must be lock-free");
 
-    std::array<Strip, kMixerStrips> strip;
+    std::array<Strip, kStrips> strip;
+    std::array<Bus, kBuses> bus;
     std::atomic<float> masterDb { 0.0f };
     std::atomic<bool> masterMute { false };
-    std::atomic<int> masterOut { 1 };
+    std::atomic<int> masterType { 0 }, masterOut { 1 };
 
-    std::array<std::atomic<float>, kMixerStrips> stripPeak {};
+    std::array<std::atomic<float>, kStrips> stripPeakL {}, stripPeakR {};
+    std::array<std::atomic<float>, kBuses> busPeakL {}, busPeakR {};
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
     std::atomic<bool> clipped { false };
 
     // Audio-thread state.
-    std::array<float, kMixerStrips> curL {}, curR {}, curD {};
+    std::array<float, kStrips> curL {}, curR {};
+    std::array<float, kBuses> curBus {};
+    std::array<int, kStrips> prevDest {};
     float curMaster = 1.0f;
     bool snapped = false;
 };

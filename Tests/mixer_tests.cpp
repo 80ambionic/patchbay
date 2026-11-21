@@ -1,4 +1,4 @@
-// Mixer DSP core + settings model. Pure C++ (no JUCE).
+// Mixer DSP core, device router and settings model. Pure C++ (no JUCE).
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -18,582 +18,475 @@ static int failures = 0, checks = 0;
 struct T { const char* n; void (*f)(); };
 static std::vector<T>& tests() { static std::vector<T> t; return t; }
 
-// Interleaved constant-level input on `ch` channels, value v on channel c, 0 elsewhere.
-static std::vector<float> make (int ch, int frames, int onlyCh, float v)
+// Interleaved bank, `ch` channels, channel c holds the constant vals[c] (0 if beyond vals).
+static std::vector<float> bank (int ch, int frames, std::vector<float> vals)
 {
     std::vector<float> d ((size_t) ch * (size_t) frames, 0.0f);
-    for (int n = 0; n < frames; ++n) d[(size_t) n * (size_t) ch + (size_t) onlyCh] = v;
+    for (int n = 0; n < frames; ++n)
+        for (int c = 0; c < ch && c < (int) vals.size(); ++c) d[(size_t) n * (size_t) ch + (size_t) c] = vals[(size_t) c];
     return d;
 }
 
-static MixerSettings flat()      // all strips unity, centred, no mute
+// Everything off, every strip centred: tests switch on only what they need.
+static MixerSettings blank()
 {
     MixerSettings s;
-    for (auto& st : s.strips) st.pan = 0.0f;
+    for (auto& st : s.strips) { st.src = { SourceType::off, 0 }; }
     return s;
 }
 
-struct Out { std::vector<float> l, r; };
-static Out run (MixerCore& m, const std::vector<float>& in, int ch, int frames)
+struct Rig
 {
-    Out o; o.l.assign ((size_t) frames, 0.0f); o.r.assign ((size_t) frames, 0.0f);
-    m.process (in.data(), ch, frames, o.l.data(), o.r.data());
-    return o;
+    static constexpr float kSentinel = 7.0f;
+    int frames;
+    std::vector<float> mL, mR;
+    std::array<std::vector<float>, kBuses> bL, bR;
+    std::array<float*, kBuses> bLp {}, bRp {};
+    MixerCore::Routing routing;
+
+    explicit Rig (int f) : frames (f), mL ((size_t) f), mR ((size_t) f)
+    {
+        for (int b = 0; b < kBuses; ++b)
+        {
+            bL[(size_t) b].assign ((size_t) f, kSentinel); bR[(size_t) b].assign ((size_t) f, kSentinel);
+            bLp[(size_t) b] = bL[(size_t) b].data(); bRp[(size_t) b] = bR[(size_t) b].data();
+        }
+    }
+    MixerCore::Output out (bool withBuses = true)
+    {
+        MixerCore::Output o; o.masterL = mL.data(); o.masterR = mR.data();
+        if (withBuses) { o.busL = bLp.data(); o.busR = bRp.data(); }
+        return o;
+    }
+    void run (MixerCore& m, MixerCore::Input net, MixerCore::Input app, MixerCore::Input dev, bool withBuses = true)
+    {
+        m.process (net, app, dev, frames, out (withBuses), &routing);
+    }
+    bool busUntouched (int b) const { return bL[(size_t) b][0] == kSentinel && bR[(size_t) b][frames - 1] == kSentinel; }
+};
+
+TEST (defaults_layout)
+{
+    MixerSettings s;
+    CHECK (kStrips == 32 && kBuses == 32);
+    for (int i = 0; i < 4; ++i) CHECK (s.strips[(size_t) i].src == (Source { SourceType::net, i }));
+    for (int i = 0; i < 4; ++i) CHECK (s.strips[(size_t) (4 + i)].src == (Source { SourceType::app, i }));
+    for (int i = 8; i < 32; ++i) CHECK (s.strips[(size_t) i].src == (Source { SourceType::input, i - 8 }));
+    for (const auto& st : s.strips) CHECK (st.out == 0 && st.gainDb == 0.0f && st.balance == 0.0f && ! st.mute && ! st.solo);
+    for (int b = 0; b < kBuses; ++b) CHECK (s.buses[(size_t) b].type == OutType::audio && s.buses[(size_t) b].outFirst == 2 * b + 1);
+    CHECK (s.masterType == OutType::audio && s.masterOut == 1);
+    MixerSettings c = s; c.sanitize();
+    CHECK (c == s);                                              // defaults are already valid
 }
 
-TEST (unity_centre_is_minus_3db)
+TEST (stereo_passthrough_unity)
 {
-    MixerCore m; m.setSettings (flat());
-    const auto o = run (m, make (2, 64, 0, 0.5f), 2, 64);
-    const double expect = 0.5 * std::sqrt (0.5);
-    for (int n = 0; n < 64; ++n) { NEAR (o.l[(size_t) n], expect, 1e-6); NEAR (o.r[(size_t) n], expect, 1e-6); }
-}
-
-TEST (hard_pan_left_right)
-{
-    auto s = flat(); s.strips[0].pan = -1.0f; s.strips[1].pan = 1.0f;
+    auto s = blank(); s.strips[0].src = { SourceType::net, 0 };
     MixerCore m; m.setSettings (s);
-    auto o = run (m, make (2, 32, 0, 0.8f), 2, 32);
-    NEAR (o.l[5], 0.8, 1e-6); NEAR (o.r[5], 0.0, 1e-6);
+    Rig r (64);
+    const auto net = bank (2, 64, { 0.5f, -0.25f });
+    r.run (m, { net.data(), 2 }, {}, {});
+    for (int n = 0; n < 64; ++n) { NEAR (r.mL[(size_t) n], 0.5, 1e-6); NEAR (r.mR[(size_t) n], -0.25, 1e-6); }   // no -3 dB, no mixing of sides
+}
+
+TEST (source_pair_mapping)
+{
+    // Distinct value per channel so any wrong pair is visible. Strip i -> pair i of each bank, each on its own bus.
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 };   s.strips[0].out = 1;
+    s.strips[1].src = { SourceType::net, 3 };   s.strips[1].out = 2;
+    s.strips[2].src = { SourceType::app, 0 };   s.strips[2].out = 3;
+    s.strips[3].src = { SourceType::app, 3 };   s.strips[3].out = 4;
+    s.strips[4].src = { SourceType::input, 0 }; s.strips[4].out = 5;
+    s.strips[5].src = { SourceType::input, 31 };s.strips[5].out = 6;
+    MixerCore m; m.setSettings (s);
+    Rig r (16);
+    std::vector<float> nv, av, dv;
+    for (int c = 0; c < 8; ++c) nv.push_back (0.01f * (float) (c + 1));          // 0.01 .. 0.08
+    for (int c = 0; c < 8; ++c) av.push_back (0.1f + 0.01f * (float) c);          // 0.10 .. 0.17
+    for (int c = 0; c < 64; ++c) dv.push_back (0.002f * (float) (c + 1));         // 0.002 .. 0.128
+    const auto net = bank (8, 16, nv), app = bank (8, 16, av), dev = bank (64, 16, dv);
+    r.run (m, { net.data(), 8 }, { app.data(), 8 }, { dev.data(), 64 });
+    NEAR (r.bL[0][3], 0.01, 1e-6); NEAR (r.bR[0][3], 0.02, 1e-6);
+    NEAR (r.bL[1][3], 0.07, 1e-6); NEAR (r.bR[1][3], 0.08, 1e-6);
+    NEAR (r.bL[2][3], 0.10, 1e-6); NEAR (r.bR[2][3], 0.11, 1e-6);
+    NEAR (r.bL[3][3], 0.16, 1e-6); NEAR (r.bR[3][3], 0.17, 1e-6);
+    NEAR (r.bL[4][3], 0.002, 1e-6); NEAR (r.bR[4][3], 0.004, 1e-6);
+    NEAR (r.bL[5][3], 0.126, 1e-6); NEAR (r.bR[5][3], 0.128, 1e-6);
+    for (int b = 0; b < 6; ++b) CHECK (r.routing.busActive[(size_t) b]);
+    for (int b = 6; b < kBuses; ++b) { CHECK (! r.routing.busActive[(size_t) b]); CHECK (r.busUntouched (b)); }
+}
+
+TEST (mono_and_odd_channel_counts)
+{
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 }; s.strips[0].out = 1;
+    s.strips[1].src = { SourceType::net, 1 }; s.strips[1].out = 2;
+    s.strips[2].src = { SourceType::input, 0 }; s.strips[2].out = 3;
+    MixerCore m; m.setSettings (s);
+    Rig r (8);
+    const auto mono = bank (1, 8, { 0.4f });
+    r.run (m, { mono.data(), 1 }, {}, { mono.data(), 1 });
+    NEAR (r.bL[0][2], 0.4, 1e-6); NEAR (r.bR[0][2], 0.4, 1e-6);                     // mono plays on both sides
+    NEAR (r.bL[1][2], 0.0, 1e-6); NEAR (r.bR[1][2], 0.0, 1e-6);                     // there is no pair 2
+    NEAR (r.bL[2][2], 0.4, 1e-6); NEAR (r.bR[2][2], 0.4, 1e-6);                     // mono microphone on both sides
+
+    // Three channels: pair 1 is channel 3 alone -> on both sides.
     m.reset();
-    o = run (m, make (2, 32, 1, 0.8f), 2, 32);
-    NEAR (o.l[5], 0.0, 1e-6); NEAR (o.r[5], 0.8, 1e-6);
+    const auto three = bank (3, 8, { 0.1f, 0.2f, 0.3f });
+    r.run (m, { three.data(), 3 }, {}, {});
+    NEAR (r.bL[0][2], 0.1, 1e-6); NEAR (r.bR[0][2], 0.2, 1e-6);
+    NEAR (r.bL[1][2], 0.3, 1e-6); NEAR (r.bR[1][2], 0.3, 1e-6);
 }
 
-TEST (constant_power_across_pan)
+TEST (missing_bank_is_silent)
 {
-    for (float p = -1.0f; p <= 1.0f; p += 0.125f)
+    auto s = blank(); s.strips[0].src = { SourceType::app, 1 }; s.strips[1].src = { SourceType::off, 0 };
+    MixerCore m; m.setSettings (s);
+    Rig r (16);
+    r.run (m, {}, {}, {});
+    for (int n = 0; n < 16; ++n) { CHECK (r.mL[(size_t) n] == 0.0f && r.mR[(size_t) n] == 0.0f); }
+    const auto app = bank (2, 16, { 0.5f, 0.5f });                                  // app bank too short for slot 1 (pair 1)
+    r.run (m, {}, { app.data(), 2 }, {});
+    CHECK (r.mL[0] == 0.0f);
+}
+
+TEST (balance_law)
+{
+    auto s = blank(); s.strips[0].src = { SourceType::net, 0 };
+    MixerCore m;
+    Rig r (16);
+    const auto net = bank (2, 16, { 1.0f, 1.0f });
+    const float cases[] = { 0.0f, 1.0f, -1.0f, 0.5f, -0.5f };
+    for (float b : cases)
     {
-        auto s = flat(); s.strips[0].pan = p;
-        MixerCore m; m.setSettings (s);
-        const auto o = run (m, make (1, 16, 0, 0.25f), 1, 16);     // mono: strips 0 and 1 both fed; use strip 0 only
-        (void) o;
-        MixerCore m2; auto s2 = s; s2.strips[1].mute = true; m2.setSettings (s2);
-        const auto o2 = run (m2, make (1, 16, 0, 1.0f), 1, 16);
-        NEAR (o2.l[3] * o2.l[3] + o2.r[3] * o2.r[3], 1.0, 1e-5);   // L^2 + R^2 == 1 for every pan position
+        s.strips[0].balance = b; m.setSettings (s); m.reset();
+        r.run (m, { net.data(), 2 }, {}, {});
+        const double el = b > 0 ? std::cos (b * M_PI / 2) : 1.0, er = b < 0 ? std::cos (-b * M_PI / 2) : 1.0;
+        NEAR (r.mL[8], el, 1e-5); NEAR (r.mR[8], er, 1e-5);
     }
+    s.strips[0].balance = 0.5f; m.setSettings (s); m.reset();
+    r.run (m, { net.data(), 2 }, {}, {});
+    NEAR (20.0 * std::log10 (r.mL[8]), -3.01, 0.02);                               // -3 dB at the quarter point
 }
 
-TEST (gain_db_accuracy)
+TEST (gain_mute_solo)
 {
-    NEAR (gainDbToLinear (0.0f), 1.0, 1e-7);
-    NEAR (gainDbToLinear (-6.0206f), 0.5, 1e-4);
-    NEAR (gainDbToLinear (20.0f - 8.0f), 3.98107, 1e-4);          // +12 dB
-    CHECK (gainDbToLinear (kMinGainDb) == 0.0f);                  // fader floor is true silence
-    CHECK (gainDbToLinear (-1000.0f) == 0.0f);
-    NEAR (gainDbToLinear (std::numeric_limits<float>::quiet_NaN()), 1.0, 1e-7);   // NaN -> 0 dB, never NaN gain
+    auto s = blank();
+    for (int i = 0; i < 3; ++i) { s.strips[(size_t) i].src = { SourceType::net, i }; s.strips[(size_t) i].out = i + 1; }
+    const auto net = bank (6, 16, { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f });
+    Rig r (16);
+    MixerCore m;
+
+    s.strips[0].gainDb = -6.0206f; m.setSettings (s); m.reset();
+    r.run (m, { net.data(), 6 }, {}, {});
+    NEAR (r.bL[0][4], 0.25, 1e-4); NEAR (r.bL[1][4], 0.5, 1e-6);
+
+    s.strips[1].gainDb = kMinGainDb; m.setSettings (s); m.reset();                    // fader at the floor = true silence
+    r.run (m, { net.data(), 6 }, {}, {});
+    CHECK (r.bL[1][4] == 0.0f);
+
+    s = blank(); for (int i = 0; i < 3; ++i) { s.strips[(size_t) i].src = { SourceType::net, i }; s.strips[(size_t) i].out = i + 1; }
+    s.strips[0].mute = true; m.setSettings (s); m.reset();
+    r.run (m, { net.data(), 6 }, {}, {});
+    CHECK (r.bL[0][4] == 0.0f); NEAR (r.bL[1][4], 0.5, 1e-6);
+
+    s.strips[1].solo = true; m.setSettings (s); m.reset();                            // solo silences the others
+    r.run (m, { net.data(), 6 }, {}, {});
+    CHECK (r.bL[0][4] == 0.0f); NEAR (r.bL[1][4], 0.5, 1e-6); CHECK (r.bL[2][4] == 0.0f);
+
+    s.strips[0].solo = true; m.setSettings (s); m.reset();                            // mute beats solo
+    r.run (m, { net.data(), 6 }, {}, {});
+    CHECK (r.bL[0][4] == 0.0f); NEAR (r.bL[1][4], 0.5, 1e-6);
 }
 
-TEST (mute_solo_rules)
+TEST (solo_spans_banks)
 {
-    auto s = flat(); s.strips[0].pan = -1.0f; s.strips[1].pan = 1.0f;
-    {   // mute
-        auto t = s; t.strips[0].mute = true;
-        MixerCore m; m.setSettings (t);
-        const auto o = run (m, make (2, 16, 0, 1.0f), 2, 16);
-        NEAR (o.l[4], 0.0, 1e-7);
-    }
-    {   // solo strip 1: strip 0 goes silent, strip 1 stays
-        auto t = s; t.strips[1].solo = true;
-        MixerCore m; m.setSettings (t);
-        std::vector<float> in (2 * 16, 0.5f);
-        const auto o = run (m, in, 2, 16);
-        NEAR (o.l[4], 0.0, 1e-7); NEAR (o.r[4], 0.5, 1e-6);
-    }
-    {   // mute beats solo
-        auto t = s; t.strips[1].solo = true; t.strips[1].mute = true;
-        MixerCore m; m.setSettings (t);
-        std::vector<float> in (2 * 16, 0.5f);
-        const auto o = run (m, in, 2, 16);
-        NEAR (o.l[4], 0.0, 1e-7); NEAR (o.r[4], 0.0, 1e-7);
-    }
-    {   // two solos both play
-        auto t = s; t.strips[0].solo = true; t.strips[1].solo = true;
-        MixerCore m; m.setSettings (t);
-        std::vector<float> in (2 * 16, 0.5f);
-        const auto o = run (m, in, 2, 16);
-        NEAR (o.l[4], 0.5, 1e-6); NEAR (o.r[4], 0.5, 1e-6);
-    }
-}
-
-TEST (channel_mapping_rules)
-{
-    auto s = flat();
-    {   // mono input feeds strips 1 and 2 only
-        MixerCore m; m.setSettings (s);
-        const auto o = run (m, make (1, 16, 0, 0.5f), 1, 16);
-        NEAR (o.l[2], 2.0 * 0.5 * std::sqrt (0.5), 1e-6);          // two strips, each centred at -3 dB
-    }
-    {   // 8-channel input with only channel 7 live
-        MixerCore m; m.setSettings (s);
-        const auto o = run (m, make (8, 16, 7, 0.4f), 8, 16);
-        NEAR (o.l[2], 0.4 * std::sqrt (0.5), 1e-6);
-    }
-    {   // more channels than strips: extra ignored, no out-of-bounds read (ASan checks)
-        MixerCore m; m.setSettings (s);
-        std::vector<float> in (12 * 16, 0.1f);
-        const auto o = run (m, in, 12, 16);
-        NEAR (o.l[2], 8 * 0.1 * std::sqrt (0.5), 1e-5);
-    }
-    {   // stereo input: strips 3..8 silent
-        MixerCore m; m.setSettings (s);
-        std::vector<float> in (2 * 16, 0.0f);
-        const auto o = run (m, in, 2, 16);
-        NEAR (o.l[2], 0.0, 1e-9);
-    }
-}
-
-TEST (master_gain_and_mute)
-{
-    auto s = flat(); s.strips[0].pan = -1.0f; s.masterDb = -6.0206f;
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 };   s.strips[0].out = 1;
+    s.strips[1].src = { SourceType::app, 0 };   s.strips[1].out = 2;
+    s.strips[2].src = { SourceType::input, 0 }; s.strips[2].out = 3; s.strips[2].solo = true;
     MixerCore m; m.setSettings (s);
-    auto o = run (m, make (2, 16, 0, 0.8f), 2, 16);
-    NEAR (o.l[3], 0.4, 1e-4);
-    s.masterMute = true; m.setSettings (s); m.reset();
-    o = run (m, make (2, 16, 0, 0.8f), 2, 16);
-    NEAR (o.l[3], 0.0, 1e-9);
+    Rig r (8);
+    const auto d = bank (2, 8, { 0.3f, 0.3f });
+    r.run (m, { d.data(), 2 }, { d.data(), 2 }, { d.data(), 2 });
+    CHECK (r.bL[0][3] == 0.0f && r.bL[1][3] == 0.0f); NEAR (r.bL[2][3], 0.3, 1e-6);
 }
 
-TEST (ramp_is_smooth_and_lands_on_target)
+TEST (routing_to_master_and_buses)
 {
-    auto s = flat(); s.strips[0].pan = -1.0f;
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 };                      // -> master
+    s.strips[1].src = { SourceType::net, 1 }; s.strips[1].out = 5; // -> bus 5
+    s.strips[2].src = { SourceType::net, 0 }; s.strips[2].out = 5; // also bus 5: sums
+    s.buses[4].type = OutType::net; s.buses[4].outFirst = 9;
+    s.masterType = OutType::net; s.masterOut = 3;
     MixerCore m; m.setSettings (s);
-    const auto in = make (2, 256, 0, 1.0f);                        // only strip 1 carries signal
-    run (m, in, 2, 256);                                           // establishes unity (first block snaps)
-    m.setStripGainDb (0, -20.0f);                                  // a big jump: 0.1 linear
-    const auto o = run (m, in, 2, 256);
-    double maxStep = 0.0;
-    for (int n = 1; n < 256; ++n) maxStep = std::max (maxStep, (double) std::abs (o.l[(size_t) n] - o.l[(size_t) n - 1]));
-    CHECK (maxStep < 0.01);                                        // would be 0.9 without ramping
-    CHECK (o.l[0] > 0.9);                                          // starts near the old gain
-    NEAR (o.l[255], 0.1, 0.005);                                   // ends at the target
-    const auto o2 = run (m, in, 2, 256);                           // next block is exactly steady
-    NEAR (o2.l[0], 0.1, 1e-5); NEAR (o2.l[255], 0.1, 1e-5);
+    Rig r (8);
+    const auto net = bank (4, 8, { 0.1f, 0.1f, 0.2f, 0.2f });
+    r.run (m, { net.data(), 4 }, {}, {});
+    NEAR (r.mL[2], 0.1, 1e-6);
+    NEAR (r.bL[4][2], 0.3, 1e-6); NEAR (r.bR[4][2], 0.3, 1e-6);
+    for (int b = 0; b < kBuses; ++b) CHECK (r.routing.busActive[(size_t) b] == (b == 4));
+    CHECK (r.routing.busType[4] == OutType::net && r.routing.busFirst[4] == 9);
+    CHECK (r.routing.masterType == OutType::net && r.routing.masterFirst == 3);
+    CHECK (r.busUntouched (0) && r.busUntouched (31));
 }
 
-TEST (first_block_snaps_no_fade_in)
+TEST (no_bus_buffers_falls_back_to_master)
 {
-    auto s = flat(); s.strips[0].pan = -1.0f;
+    auto s = blank(); s.strips[0].src = { SourceType::net, 0 }; s.strips[0].out = 7;
     MixerCore m; m.setSettings (s);
-    const auto o = run (m, make (2, 64, 0, 0.5f), 2, 64);
-    NEAR (o.l[0], 0.5, 1e-6);
+    Rig r (8);
+    const auto net = bank (2, 8, { 0.4f, 0.4f });
+    r.run (m, { net.data(), 2 }, {}, {}, false);
+    NEAR (r.mL[1], 0.4, 1e-6);
+    for (int b = 0; b < kBuses; ++b) CHECK (! r.routing.busActive[(size_t) b]);
 }
 
-TEST (block_size_invariance_with_static_settings)
+TEST (bus_and_master_gain_mute)
 {
-    auto s = flat(); s.strips[0].gainDb = -3.0f; s.strips[1].pan = 0.5f; s.masterDb = -1.0f;
-    std::vector<float> in (2 * 512);
-    for (size_t i = 0; i < in.size(); ++i) in[i] = std::sin ((float) i * 0.05f) * 0.5f;
-
-    MixerCore a; a.setSettings (s);
-    const auto oa = run (a, in, 2, 512);
-
-    MixerCore b; b.setSettings (s);
-    std::vector<float> bl, br;
-    for (int off = 0; off < 512; off += 64)
-    {
-        std::vector<float> chunk (in.begin() + off * 2, in.begin() + (off + 64) * 2);
-        const auto o = run (b, chunk, 2, 64);
-        bl.insert (bl.end(), o.l.begin(), o.l.end());
-        br.insert (br.end(), o.r.begin(), o.r.end());
-    }
-    for (int n = 0; n < 512; ++n) { NEAR (oa.l[(size_t) n], bl[(size_t) n], 1e-6); NEAR (oa.r[(size_t) n], br[(size_t) n], 1e-6); }
-}
-
-TEST (nonfinite_input_is_silenced_and_output_clamped)
-{
-    MixerCore m; m.setSettings (flat());
-    std::vector<float> in (2 * 32, 0.25f);
-    in[3] = std::numeric_limits<float>::quiet_NaN();
-    in[10] = std::numeric_limits<float>::infinity();
-    in[11] = -std::numeric_limits<float>::infinity();
-    const auto o = run (m, in, 2, 32);
-    for (int n = 0; n < 32; ++n) CHECK (std::isfinite (o.l[(size_t) n]) && std::isfinite (o.r[(size_t) n]));
-    CHECK (! m.takePeaks().clipped);
-
-    auto s = flat(); s.strips[0].gainDb = 12.0f; s.strips[0].pan = -1.0f; m.setSettings (s); m.reset();
-    const auto c = run (m, make (2, 16, 0, 0.9f), 2, 16);         // 0.9 * 3.98 > 1
-    for (int n = 0; n < 16; ++n) CHECK (c.l[(size_t) n] <= 1.0f && c.l[(size_t) n] >= -1.0f);
-    NEAR (c.l[4], 1.0, 1e-7);
-    const auto p = m.takePeaks();
-    CHECK (p.clipped);
-    CHECK (! m.takePeaks().clipped);                               // flag resets when read
-}
-
-TEST (meters_post_fader_pre_mute_and_reset_on_read)
-{
-    auto s = flat(); s.strips[0].gainDb = -6.0206f; s.strips[0].mute = true; s.strips[0].pan = -1.0f;
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 }; s.strips[0].out = 2;
+    s.strips[1].src = { SourceType::net, 0 };
+    s.buses[1].gainDb = -6.0206f;
+    s.masterDb = -6.0206f;
     MixerCore m; m.setSettings (s);
-    run (m, make (2, 32, 0, 0.8f), 2, 32);
+    Rig r (8);
+    const auto net = bank (2, 8, { 0.8f, 0.8f });
+    r.run (m, { net.data(), 2 }, {}, {});
+    NEAR (r.bL[1][3], 0.4, 1e-4);                                  // bus fader
+    NEAR (r.mL[3], 0.4, 1e-4);                                     // master fader (bus does not pass through the master)
+
+    s.buses[1].mute = true; s.masterMute = true; m.setSettings (s); m.reset();
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (r.bL[1][3] == 0.0f && r.mL[3] == 0.0f);
+}
+
+TEST (clamp_and_clip_flag)
+{
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 }; s.strips[0].out = 1; s.strips[0].gainDb = 12.0f;
+    MixerCore m; m.setSettings (s);
+    Rig r (8);
+    const auto net = bank (2, 8, { 1.0f, -1.0f });
+    r.run (m, { net.data(), 2 }, {}, {});
+    for (int n = 0; n < 8; ++n) { CHECK (r.bL[0][(size_t) n] == 1.0f); CHECK (r.bR[0][(size_t) n] == -1.0f); }
     auto p = m.takePeaks();
-    NEAR (p.strip[0], 0.4, 1e-4);                                  // muted strip still metered, post-fader
-    NEAR (p.masterL, 0.0, 1e-9);                                   // ...but silent on the master
-    CHECK (p.strip[1] == 0.0f);
-    p = m.takePeaks();
-    CHECK (p.strip[0] == 0.0f);
+    CHECK (p.clipped);
+    CHECK (! m.takePeaks().clipped);                               // the flag is consumed
+
+    s = blank(); s.strips[0].src = { SourceType::net, 0 }; s.strips[0].gainDb = 12.0f; m.setSettings (s); m.reset();
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (r.mL[0] == 1.0f && r.mR[0] == -1.0f);
+    CHECK (m.takePeaks().clipped);
 }
 
-TEST (control_inputs_are_sanitised)
+TEST (ramps_and_snap)
 {
-    MixerCore m;
-    m.setStripGainDb (-1, 5.0f); m.setStripGainDb (99, 5.0f);      // out-of-range index: ignored, no crash
-    m.setStripPan (7, std::numeric_limits<float>::quiet_NaN());
-    m.setStripGainDb (0, 1e30f);
-    m.setStripPan (0, -50.0f);
-    const auto o = run (m, make (2, 8, 0, 0.01f), 2, 8);
-    CHECK (std::isfinite (o.l[2]) && std::isfinite (o.r[2]));
-    NEAR (o.l[2], 0.01 * gainDbToLinear (kMaxGainDb), 1e-5);       // clamped to +12 dB, hard left
-    CHECK (clampGainDb (-1e9f) == kMinGainDb && clampGainDb (1e9f) == kMaxGainDb);
-    CHECK (clampPan (std::numeric_limits<float>::infinity()) == 0.0f);
+    auto s = blank(); s.strips[0].src = { SourceType::net, 0 };
+    MixerCore m; m.setSettings (s);
+    Rig r (100);
+    const auto net = bank (2, 100, { 1.0f, 1.0f });
+    r.run (m, { net.data(), 2 }, {}, {});                          // first block snaps to unity
+    NEAR (r.mL[0], 1.0, 1e-6);
+    m.setStripMute (0, true);
+    r.run (m, { net.data(), 2 }, {}, {});                          // then fades out linearly over the block
+    NEAR (r.mL[0], 0.99, 1e-4); NEAR (r.mL[49], 0.50, 1e-4); NEAR (r.mL[99], 0.0, 1e-6);
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (r.mL[0] == 0.0f);
+    m.setStripMute (0, false);
+    r.run (m, { net.data(), 2 }, {}, {});
+    NEAR (r.mL[49], 0.5, 1e-4); NEAR (r.mL[99], 1.0, 1e-6);
+    m.reset();
+    m.setStripMute (0, true);
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (r.mL[0] == 0.0f);                                       // after reset(), straight to the target
+}
 
-    MixerSettings s; s.strips[0].gainDb = std::numeric_limits<float>::quiet_NaN(); s.masterDb = 500.0f;
-    s.strips[1].name = std::string ("a\x01\x02" "b") + std::string (40, 'z');
+TEST (route_change_crossfades)
+{
+    auto s = blank(); s.strips[0].src = { SourceType::net, 0 };     // master
+    MixerCore m; m.setSettings (s);
+    Rig r (100);
+    const auto net = bank (2, 100, { 1.0f, 1.0f });
+    r.run (m, { net.data(), 2 }, {}, {});
+    m.setStripOut (0, 3);                                          // master -> bus 3
+    r.run (m, { net.data(), 2 }, {}, {});
+    for (int n : { 0, 25, 50, 75, 99 }) NEAR (r.mL[(size_t) n] + r.bL[2][(size_t) n], 1.0, 1e-4);   // one block crossfade, no dip, no click
+    NEAR (r.bL[2][99], 1.0, 1e-6); NEAR (r.mL[99], 0.0, 1e-6);
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (r.mL[0] == 0.0f); NEAR (r.bL[2][50], 1.0, 1e-6);
+
+    m.setStripOut (0, 4);                                          // bus 3 -> bus 4: bus 3 stays active for the fade
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (r.routing.busActive[2] && r.routing.busActive[3]);
+    for (int n : { 0, 40, 99 }) NEAR (r.bL[2][(size_t) n] + r.bL[3][(size_t) n], 1.0, 1e-4);
+    r.run (m, { net.data(), 2 }, {}, {});
+    CHECK (! r.routing.busActive[2] && r.routing.busActive[3]);
+}
+
+TEST (hostile_input_samples)
+{
+    auto s = blank(); s.strips[0].src = { SourceType::net, 0 };
+    MixerCore m; m.setSettings (s);
+    Rig r (8);
+    auto net = bank (2, 8, { 0.5f, 0.5f });
+    net[2] = std::numeric_limits<float>::quiet_NaN();
+    net[3] = std::numeric_limits<float>::infinity();
+    net[4] = -std::numeric_limits<float>::infinity();
+    r.run (m, { net.data(), 2 }, {}, {});
+    for (int n = 0; n < 8; ++n) { CHECK (std::isfinite (r.mL[(size_t) n]) && std::isfinite (r.mR[(size_t) n])); }
+    CHECK (r.mL[1] == 0.0f && r.mR[1] == 0.0f && r.mL[2] == 0.0f);
+}
+
+TEST (meters)
+{
+    auto s = blank();
+    s.strips[0].src = { SourceType::net, 0 }; s.strips[0].gainDb = -6.0206f; s.strips[0].mute = true; s.strips[0].balance = 1.0f;
+    s.strips[1].src = { SourceType::net, 0 }; s.strips[1].out = 2; s.buses[1].gainDb = -6.0206f;
+    MixerCore m; m.setSettings (s);
+    Rig r (16);
+    const auto net = bank (2, 16, { 0.8f, 0.4f });
+    r.run (m, { net.data(), 2 }, {}, {});
+    const auto p = m.takePeaks();
+    NEAR (p.stripL[0], 0.4, 1e-4); NEAR (p.stripR[0], 0.2, 1e-4);   // post-fader, pre-mute, pre-balance
+    NEAR (p.stripL[1], 0.8, 1e-6);
+    NEAR (p.busL[1], 0.4, 1e-4); NEAR (p.busR[1], 0.2, 1e-4);        // post-bus fader
+    NEAR (p.masterL, 0.0, 1e-6);                                     // strip 0 is muted, strip 1 is on a bus
+    const auto q = m.takePeaks();
+    CHECK (q.stripL[0] == 0.0f && q.busL[1] == 0.0f);                // reading resets
+}
+
+TEST (sanitize_hostile_settings)
+{
+    MixerSettings s;
+    const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+    s.strips[0].gainDb = nan; s.strips[0].balance = inf; s.strips[0].out = 999; s.strips[0].src = { (SourceType) 77, -5 };
+    s.strips[1].gainDb = 1e30f; s.strips[1].balance = -1e30f; s.strips[1].out = -4; s.strips[1].src = { SourceType::input, 9999 };
+    s.strips[2].src = { SourceType::net, 9 }; s.strips[2].name = std::string ("abc\x01\x02xyz") + std::string (100, 'q');
+    s.buses[0].type = (OutType) 9; s.buses[0].outFirst = 0; s.buses[0].gainDb = -inf;
+    s.buses[1].outFirst = 5000; s.buses[1].dest = { "bad host/with spaces", 70000 };
+    s.buses[2].dest = { std::string (500, 'a'), -1 };
+    s.buses[3].dest = { "192.168.1.20", 9100 };
+    s.masterOut = -1; s.masterType = (OutType) -3; s.masterDb = nan; s.masterDest = { "host_name-1.local", 0 };
+    s.apps[0].bundleId = "bad id!"; s.apps[0].name = std::string (500, 'n');
     s.sanitize();
-    CHECK (s.strips[0].gainDb == 0.0f && s.masterDb == kMaxGainDb);
-    CHECK (s.strips[1].name.size() == kMaxStripNameLength && s.strips[1].name.substr (0, 2) == "ab");
+
+    CHECK (s.strips[0].gainDb == 0.0f && s.strips[0].balance == 0.0f && s.strips[0].out == kBuses && s.strips[0].src == (Source { SourceType::off, 0 }));
+    CHECK (s.strips[1].gainDb == kMaxGainDb && s.strips[1].balance == -1.0f && s.strips[1].out == 0);
+    CHECK (s.strips[1].src == (Source { SourceType::input, kDevicePairs - 1 }));
+    CHECK (s.strips[2].src == (Source { SourceType::net, kNetPairs - 1 }));
+    CHECK (s.strips[2].name.size() == kMaxStripNameLength && s.strips[2].name.substr (0, 3) == "abc" && s.strips[2].name.find ('\x01') == std::string::npos);
+    CHECK (s.buses[0].type == OutType::audio && s.buses[0].outFirst == 1 && s.buses[0].gainDb == 0.0f);
+    CHECK (s.buses[1].outFirst == kMaxDeviceOutputs - 1 && s.buses[1].dest.host.empty() && s.buses[1].dest.port == kDefaultNetOutPort);
+    CHECK (s.buses[2].dest.host.empty() && s.buses[2].dest.port == kDefaultNetOutPort);
+    CHECK (s.buses[3].dest.host == "192.168.1.20" && s.buses[3].dest.port == 9100);
+    CHECK (s.masterOut == 1 && s.masterType == OutType::audio && s.masterDb == 0.0f);
+    CHECK (s.masterDest.host == "host_name-1.local" && s.masterDest.port == kDefaultNetOutPort);
+    CHECK (s.apps[0].bundleId.empty() && s.apps[0].name.empty());
+
+    CHECK (isValidHost ("") && isValidHost ("10.0.0.5") && ! isValidHost ("a b") && ! isValidHost ("http://x") && ! isValidHost ("[::1]"));
 }
 
-TEST (defaults_play_stereo_out_of_the_box)
+TEST (core_applies_sanitized_settings)
 {
-    MixerCore m;                                                   // default settings: strip1 hard L, strip2 hard R
-    std::vector<float> in (2 * 16);
-    for (int n = 0; n < 16; ++n) { in[(size_t) n * 2] = 0.3f; in[(size_t) n * 2 + 1] = -0.6f; }
-    const auto o = run (m, in, 2, 16);
-    NEAR (o.l[5], 0.3, 1e-6); NEAR (o.r[5], -0.6, 1e-6);
+    MixerSettings s = blank();
+    s.strips[0].src = { SourceType::net, 99 }; s.strips[0].out = 500; s.strips[0].balance = 50.0f;
+    MixerCore m; m.setSettings (s);
+    Rig r (8);
+    const auto net = bank (8, 8, { 0.1f, 0.1f, 0.2f, 0.2f, 0.3f, 0.3f, 0.4f, 0.4f });
+    r.run (m, { net.data(), 8 }, {}, {});
+    NEAR (r.bL[31][2], 0.0, 1e-6);                                  // balance clamped to +1: left silenced
+    NEAR (r.bR[31][2], 0.4, 1e-6);                                  // index clamped to pair 3, out clamped to bus 32
+    m.setStripSource (-1, { SourceType::net, 0 }); m.setStripGainDb (999, 0.0f); m.setBusGainDb (-3, 0.0f); m.setBusType (77, OutType::net);   // out-of-range ids are ignored
 }
 
-TEST (concurrent_control_and_process)
+TEST (settings_from_another_thread)
 {
-    MixerCore m;
+    auto s = blank(); for (int i = 0; i < 8; ++i) s.strips[(size_t) i].src = { SourceType::net, i % 4 };
+    MixerCore m; m.setSettings (s);
     std::atomic<bool> stop { false };
     std::thread ui ([&]
     {
-        float v = 0.0f;
+        int k = 0;
         while (! stop.load())
         {
-            v += 0.37f; if (v > 12.0f) v = -70.0f;
-            const int i = (int) std::fmod (v * 100.0f + 1000.0f, 8.0f);
-            m.setStripGainDb (i, v); m.setStripPan (i, v / 12.0f); m.setStripMute (i, v > 6.0f); m.setStripSolo (i, v < -65.0f);
-            m.setMasterDb (v);
-            (void) m.takePeaks();
+            ++k;
+            m.setStripGainDb (k % 8, (float) (k % 40) - 30.0f); m.setStripBalance (k % 8, ((k % 21) - 10) / 10.0f);
+            m.setStripMute (k % 8, k % 3 == 0); m.setStripSolo (k % 8, k % 5 == 0);
+            m.setStripOut (k % 8, k % 6); m.setStripSource (k % 8, { (SourceType) (k % 4), k % 40 });
+            m.setBusGainDb (k % 32, -(float) (k % 20)); m.setBusMute (k % 32, k % 4 == 0); m.setBusType (k % 32, (OutType) (k % 2)); m.setBusOutFirst (k % 32, k % 70);
+            m.setMasterDb ((float) (k % 12)); m.setMasterMute (k % 7 == 0); m.setMasterType ((OutType) (k % 2)); m.setMasterOut (k % 70);
+            m.takePeaks();
         }
     });
-    std::vector<float> in (2 * 128, 0.5f);
-    Out o; o.l.resize (128); o.r.resize (128);
-    bool finite = true;
-    for (int i = 0; i < 20000; ++i)
+    Rig r (64);
+    const auto net = bank (8, 64, { 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f });
+    const auto dev = bank (64, 64, { 0.2f, 0.2f });
+    for (int i = 0; i < 4000; ++i)
     {
-        m.process (in.data(), 2, 128, o.l.data(), o.r.data());
-        for (int n = 0; n < 128; ++n) finite = finite && std::isfinite (o.l[(size_t) n]) && std::abs (o.l[(size_t) n]) <= 1.0f;
+        r.run (m, { net.data(), 8 }, { net.data(), 8 }, { dev.data(), 64 });
+        for (int n = 0; n < 64; ++n) { if (! (std::abs (r.mL[(size_t) n]) <= 1.0f && std::abs (r.mR[(size_t) n]) <= 1.0f)) { CHECK (false); break; } }
     }
     stop = true; ui.join();
-    CHECK (finite);
+    CHECK (true);
 }
 
-
-// ---- banks, direct outs, device routing -----------------------------------------------------------------------
-using Dir = std::array<std::vector<float>, kMixerStrips>;
-struct DirPtrs
-{
-    Dir buf; std::array<float*, kMixerStrips> p {};
-    explicit DirPtrs (int frames) { for (size_t i = 0; i < buf.size(); ++i) { buf[i].assign ((size_t) frames, 123.0f); p[i] = buf[i].data(); } }
-};
-
-TEST (app_bank_feeds_strips_9_to_16)
-{
-    auto s = flat(); s.strips[8].pan = -1.0f; s.strips[9].pan = 1.0f;
-    MixerCore m; m.setSettings (s);
-    std::vector<float> app (8 * 16, 0.0f);
-    for (int n = 0; n < 16; ++n) { app[(size_t) n * 8 + 0] = 0.5f; app[(size_t) n * 8 + 1] = -0.25f; }
-    Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-    m.process (MixerCore::Input {}, MixerCore::Input { app.data(), 8 }, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    NEAR (o.l[4], 0.5, 1e-6); NEAR (o.r[4], -0.25, 1e-6);
-    const auto pk = m.takePeaks();
-    NEAR (pk.strip[8], 0.5, 1e-6); NEAR (pk.strip[9], 0.25, 1e-6); CHECK (pk.strip[0] == 0.0f);
-}
-
-TEST (app_bank_has_no_mono_duplication_and_banks_do_not_bleed)
-{
-    MixerCore m; m.setSettings (flat());
-    std::vector<float> app (1 * 16, 0.5f), net (2 * 16, 0.0f);
-    Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-    m.process (MixerCore::Input { net.data(), 2 }, MixerCore::Input { app.data(), 1 }, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    NEAR (o.l[3], 0.5 * std::sqrt (0.5), 1e-6);                   // only app channel 1 (strip 9), not strip 10
-    m.takePeaks();
-    std::vector<float> net2 (2 * 16, 0.3f);
-    m.process (MixerCore::Input { net2.data(), 2 }, MixerCore::Input {}, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    const auto pk = m.takePeaks();
-    for (int i = 8; i < kMixerStrips; ++i) CHECK (pk.strip[(size_t) i] == 0.0f);
-}
-
-TEST (solo_spans_both_banks)
-{
-    auto s = flat(); s.strips[8].solo = true; s.strips[8].pan = -1.0f;
-    MixerCore m; m.setSettings (s);
-    std::vector<float> net (2 * 16, 0.9f), app (8 * 16, 0.2f);
-    Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-    m.process (MixerCore::Input { net.data(), 2 }, MixerCore::Input { app.data(), 8 }, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    NEAR (o.l[4], 0.2, 1e-6); NEAR (o.r[4], 0.0, 1e-6);           // network strips silenced by the app solo
-}
-
-TEST (direct_out_bypasses_pan_and_master)
-{
-    auto s = flat(); s.strips[0].gainDb = -6.0206f; s.strips[0].directOut = 5; s.strips[0].pan = -1.0f; s.masterDb = -20.0f;
-    s.strips[1].mute = true;
-    MixerCore m; m.setSettings (s);
-    DirPtrs d (16);
-    MixerCore::Routing r;
-    std::vector<float> in = make (2, 16, 0, 0.8f);
-    Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-    m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 16, o.l.data(), o.r.data(), d.p.data(), &r);
-    CHECK (r.directCh[0] == 5);
-    for (int i = 1; i < kMixerStrips; ++i) CHECK (r.directCh[(size_t) i] == 0);
-    NEAR (d.buf[0][7], 0.4, 1e-4);                                 // post-fader, no pan law, no master gain
-    NEAR (o.l[7], 0.0, 1e-9); NEAR (o.r[7], 0.0, 1e-9);            // and absent from the master bus
-    CHECK (r.masterFirst == 1);
-}
-
-TEST (direct_out_respects_mute_solo_and_is_ignored_without_buffer)
-{
-    auto s = flat(); s.strips[0].directOut = 3; s.strips[0].pan = -1.0f; s.strips[0].mute = true;
-    {
-        MixerCore m; m.setSettings (s);
-        DirPtrs d (16); MixerCore::Routing r; auto in = make (2, 16, 0, 0.5f);
-        Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-        m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 16, o.l.data(), o.r.data(), d.p.data(), &r);
-        CHECK (r.directCh[0] == 3);
-        NEAR (d.buf[0][5], 0.0, 1e-9);                             // muted: the buffer is written, with silence (no stale data)
-    }
-    {
-        s.strips[0].mute = false;
-        MixerCore m; m.setSettings (s);
-        auto in = make (2, 16, 0, 0.5f);
-        const auto o = run (m, in, 2, 16);                         // compat process(): no direct buffers
-        NEAR (o.l[5], 0.5, 1e-6);                                  // plays through the master instead of vanishing
-    }
-}
-
-TEST (direct_out_with_no_input_channel_writes_silence)
-{
-    auto s = flat(); s.strips[5].directOut = 9;
-    MixerCore m; m.setSettings (s);
-    DirPtrs d (8); MixerCore::Routing r;
-    auto in = make (2, 8, 0, 0.5f);
-    Out o; o.l.assign (8, 0); o.r.assign (8, 0);
-    m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 8, o.l.data(), o.r.data(), d.p.data(), &r);
-    CHECK (r.directCh[5] == 9);
-    for (float v : d.buf[5]) CHECK (v == 0.0f);
-}
-
-TEST (switching_route_ramps_without_clicks)
-{
-    auto s = flat(); s.strips[0].pan = -1.0f;
-    MixerCore m; m.setSettings (s);
-    DirPtrs d (256); MixerCore::Routing r;
-    auto in = make (2, 256, 0, 1.0f);
-    Out o; o.l.assign (256, 0); o.r.assign (256, 0);
-    m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 256, o.l.data(), o.r.data(), d.p.data(), &r);
-    m.setStripDirectOut (0, 2);
-    m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 256, o.l.data(), o.r.data(), d.p.data(), &r);
-    double maxStepM = 0, maxStepD = 0;
-    for (int n = 1; n < 256; ++n)
-    {
-        maxStepM = std::max (maxStepM, (double) std::abs (o.l[(size_t) n] - o.l[(size_t) n - 1]));
-        maxStepD = std::max (maxStepD, (double) std::abs (d.buf[0][(size_t) n] - d.buf[0][(size_t) n - 1]));
-    }
-    CHECK (maxStepM < 0.01 && maxStepD < 0.01);                    // master fades out while the direct path fades in
-    NEAR (o.l[255], 0.0, 0.01); NEAR (d.buf[0][255], 1.0, 0.01);
-}
-
-TEST (master_out_pair_is_reported_and_clamped)
-{
-    MixerCore m;
-    m.setMasterOut (7); m.setStripDirectOut (0, 9999);
-    DirPtrs d (4); MixerCore::Routing r; auto in = make (2, 4, 0, 0.1f);
-    Out o; o.l.assign (4, 0); o.r.assign (4, 0);
-    m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 4, o.l.data(), o.r.data(), d.p.data(), &r);
-    CHECK (r.masterFirst == 7);
-    CHECK (r.directCh[0] == kMaxDeviceOutputs);
-    m.setMasterOut (-4); m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 4, o.l.data(), o.r.data(), d.p.data(), &r);
-    CHECK (r.masterFirst == 1);
-    m.setMasterOut (1000); m.process (MixerCore::Input { in.data(), 2 }, MixerCore::Input {}, 4, o.l.data(), o.r.data(), d.p.data(), &r);
-    CHECK (r.masterFirst == kMaxDeviceOutputs - 1);                // the pair must still fit: (63, 64)
-}
-
+// ---- device router -------------------------------------------------------------------------------------------------
 struct Dev
 {
     std::vector<std::vector<float>> ch; std::vector<float*> p;
-    Dev (int n, int frames, float fill = 0.0f) { ch.assign ((size_t) n, std::vector<float> ((size_t) frames, fill)); for (auto& c : ch) p.push_back (c.data()); }
+    Dev (int n, int frames) : ch ((size_t) n, std::vector<float> ((size_t) frames, 0.0f)) { for (auto& c : ch) p.push_back (c.data()); }
 };
 
-TEST (router_master_pair_placement)
+TEST (router_places_pairs)
 {
-    std::vector<float> L (8, 0.5f), R (8, -0.5f);
-    Dev dev (8, 8);
-    CHECK (! routeToDevice (L.data(), R.data(), 3, nullptr, nullptr, 0, 8, dev.p.data(), 8, 0));
-    for (int c = 0; c < 8; ++c)
-        for (int n = 0; n < 8; ++n)
-            NEAR (dev.ch[(size_t) c][(size_t) n], c == 2 ? 0.5 : (c == 3 ? -0.5 : 0.0), 1e-9);
+    Dev d (6, 8);
+    std::vector<float> l (8, 0.1f), r (8, 0.2f), l2 (8, 0.3f), r2 (8, 0.4f);
+    StereoOut outs[2] = { { l.data(), r.data(), 1 }, { l2.data(), r2.data(), 5 } };
+    CHECK (! routeToDevice (outs, 2, 8, d.p.data(), 6, 0));
+    NEAR (d.ch[0][3], 0.1, 1e-6); NEAR (d.ch[1][3], 0.2, 1e-6); NEAR (d.ch[4][3], 0.3, 1e-6); NEAR (d.ch[5][3], 0.4, 1e-6);
+    CHECK (d.ch[2][3] == 0.0f && d.ch[3][3] == 0.0f);
 }
 
-TEST (router_mono_and_edge_devices)
+TEST (router_sums_clamps_and_skips)
 {
-    std::vector<float> L (4, 0.6f), R (4, 0.2f);
-    {   // mono device: fold to L
-        Dev dev (1, 4);
-        routeToDevice (L.data(), R.data(), 1, nullptr, nullptr, 0, 4, dev.p.data(), 1, 0);
-        NEAR (dev.ch[0][2], 0.4, 1e-6);
-    }
-    {   // pair starting on the last channel of a stereo device: L plays folded, nothing is written out of bounds
-        Dev dev (2, 4);
-        routeToDevice (L.data(), R.data(), 2, nullptr, nullptr, 0, 4, dev.p.data(), 2, 0);
-        NEAR (dev.ch[0][1], 0.0, 1e-9); NEAR (dev.ch[1][1], 0.4, 1e-6);
-    }
-    {   // pair entirely past the device: nothing happens
-        Dev dev (2, 4);
-        CHECK (! routeToDevice (L.data(), R.data(), 5, nullptr, nullptr, 0, 4, dev.p.data(), 2, 0));
-        NEAR (dev.ch[0][1], 0.0, 1e-9); NEAR (dev.ch[1][1], 0.0, 1e-9);
-    }
-    {   // null channel pointer + zero channels + zero frames are all tolerated
-        Dev dev (2, 4); dev.p[0] = nullptr;
-        routeToDevice (L.data(), R.data(), 1, nullptr, nullptr, 0, 4, dev.p.data(), 2, 0);
-        routeToDevice (L.data(), R.data(), 1, nullptr, nullptr, 0, 4, dev.p.data(), 0, 0);
-        routeToDevice (L.data(), R.data(), 1, nullptr, nullptr, 0, 0, dev.p.data(), 2, 0);
-        routeToDevice (L.data(), R.data(), 1, nullptr, nullptr, 0, 4, nullptr, 2, 0);
-        CHECK (true);
-    }
+    Dev d (4, 8);
+    std::vector<float> a (8, 0.7f), b (8, 0.6f);
+    StereoOut outs[3] = { { a.data(), a.data(), 1 }, { b.data(), b.data(), 1 }, { a.data(), a.data(), 9 } };   // pair 9-10 is off the device
+    CHECK (routeToDevice (outs, 3, 8, d.p.data(), 4, 0));            // 1.3 clamps
+    CHECK (d.ch[0][0] == 1.0f && d.ch[1][7] == 1.0f && d.ch[2][0] == 0.0f);
+
+    Dev e (4, 8);
+    StereoOut nul[2] = { { nullptr, a.data(), 1 }, { a.data(), nullptr, 3 } };
+    CHECK (! routeToDevice (nul, 2, 8, e.p.data(), 4, 0));
+    CHECK (e.ch[0][0] == 0.0f && e.ch[2][0] == 0.0f);
+    CHECK (! routeToDevice (nullptr, 0, 8, e.p.data(), 4, 0) && ! routeToDevice (nul, 2, 0, e.p.data(), 4, 0) && ! routeToDevice (nul, 2, 8, nullptr, 4, 0));
 }
 
-TEST (router_direct_outs_sum_offset_and_clamp)
+TEST (router_mono_fold_offset_and_nan)
 {
-    std::vector<float> L (8, 0.0f), R (8, 0.0f), a (8, 0.3f), b (8, 0.4f), c (8, 0.9f);
-    const float* dp[3] { a.data(), b.data(), c.data() };
-    const int dc[3] { 4, 4, 0 };                                   // two strips share channel 4; the third is not routed
-    Dev dev (6, 16);                                               // 16-frame device buffers, writing at offset 8
-    CHECK (! routeToDevice (L.data(), R.data(), 1, dp, dc, 3, 8, dev.p.data(), 6, 8));
-    NEAR (dev.ch[3][8], 0.7, 1e-6); NEAR (dev.ch[3][15], 0.7, 1e-6);
-    NEAR (dev.ch[3][0], 0.0, 1e-9);                                // below the offset untouched
-    NEAR (dev.ch[4][9], 0.0, 1e-9);
+    Dev d (1, 16);
+    std::vector<float> l (8, 0.4f), r (8, 0.2f);
+    StereoOut o { l.data(), r.data(), 1 };
+    routeToDevice (&o, 1, 8, d.p.data(), 1, 8);                     // R is off the device: L gets the average, written at offset 8
+    NEAR (d.ch[0][8], 0.3, 1e-6); CHECK (d.ch[0][0] == 0.0f);
 
-    std::vector<float> hot (8, 0.8f);
-    const float* dp2[2] { hot.data(), hot.data() };
-    const int dc2[2] { 2, 2 };
-    Dev dev2 (4, 8);
-    CHECK (routeToDevice (L.data(), R.data(), 1, dp2, dc2, 2, 8, dev2.p.data(), 4, 0));   // 1.6 -> clamped, reported
-    NEAR (dev2.ch[1][3], 1.0, 1e-9);
-
-    const int dcBad[2] { 99, -3 };                                 // outside the device or negative: skipped
-    Dev dev3 (4, 8);
-    routeToDevice (L.data(), R.data(), 1, dp2, dcBad, 2, 8, dev3.p.data(), 4, 0);
-    for (auto& ch : dev3.ch) NEAR (ch[2], 0.0, 1e-9);
-}
-
-TEST (router_master_and_direct_share_a_channel)
-{
-    std::vector<float> L (4, 0.5f), R (4, 0.0f), d (4, 0.25f);
-    const float* dp[1] { d.data() };
-    const int dc[1] { 1 };
-    Dev dev (2, 4);
-    routeToDevice (L.data(), R.data(), 1, dp, dc, 1, 4, dev.p.data(), 2, 0);
-    NEAR (dev.ch[0][1], 0.75, 1e-6);
-}
-
-TEST (app_and_direct_settings_sanitise)
-{
-    MixerSettings s;
-    s.strips[0].directOut = -5; s.strips[1].directOut = 5000; s.masterOut = 0;
-    s.apps[0] = { "com.apple.Safari", std::string ("Safari") + std::string (100, 'x'), false };
-    s.apps[1] = { "bad id; rm -rf", "Evil", true };
-    s.apps[2] = { std::string (500, 'a'), "Long", true };
-    s.apps[3] = { "com.spotify.client", "Spotify", true };
-    s.sanitize();
-    CHECK (s.strips[0].directOut == 0 && s.strips[1].directOut == kMaxDeviceOutputs && s.masterOut == 1);
-    CHECK (s.apps[0].bundleId == "com.apple.Safari" && s.apps[0].name.size() == kMaxAppNameLength && ! s.apps[0].silenceOriginal);
-    CHECK (s.apps[1] == AppTarget() && s.apps[2] == AppTarget());  // invalid bundle IDs: whole slot cleared
-    CHECK (s.apps[3].bundleId == "com.spotify.client");
-    CHECK (isValidBundleId ("com.google.Chrome.helper") && ! isValidBundleId ("") && ! isValidBundleId ("a b") && ! isValidBundleId ("a/b"));
-}
-
-TEST (concurrent_routing_changes)
-{
-    MixerCore m;
-    std::atomic<bool> stop { false };
-    std::thread ui ([&]
-    {
-        int v = 0;
-        while (! stop.load()) { ++v; m.setStripDirectOut (v % kMixerStrips, v % 70); m.setMasterOut (v % 70); m.setStripSolo (v % kMixerStrips, v % 3 == 0); }
-    });
-    DirPtrs d (128); MixerCore::Routing r;
-    std::vector<float> net (2 * 128, 0.5f), app (8 * 128, 0.2f);
-    Out o; o.l.assign (128, 0); o.r.assign (128, 0);
-    Dev dev (8, 128);
-    bool ok = true;
-    for (int i = 0; i < 20000; ++i)
-    {
-        m.process (MixerCore::Input { net.data(), 2 }, MixerCore::Input { app.data(), 8 }, 128, o.l.data(), o.r.data(), d.p.data(), &r);
-        for (auto& c : dev.ch) std::fill (c.begin(), c.end(), 0.0f);
-        routeToDevice (o.l.data(), o.r.data(), r.masterFirst, (const float* const*) d.p.data(), r.directCh.data(), kMixerStrips, 128, dev.p.data(), 8, 0);
-        for (auto& c : dev.ch) for (float v : c) ok = ok && std::isfinite (v) && std::abs (v) <= 1.0f;
-        ok = ok && r.masterFirst >= 1 && r.masterFirst <= kMaxDeviceOutputs - 1;
-    }
-    stop = true; ui.join();
-    CHECK (ok);
-}
-
-TEST (input_bank_feeds_strips_17_to_24)
-{
-    static_assert (kMixerStrips == 24 && kNetworkStrips + kAppStrips == 16, "bank layout");
-    auto s = flat(); s.strips[16].pan = -1.0f; s.strips[17].pan = 1.0f;
-    MixerCore m; m.setSettings (s);
-    std::vector<float> dev (4 * 16, 0.0f);                                    // a 4-channel input device
-    for (int n = 0; n < 16; ++n) { dev[(size_t) n * 4 + 0] = 0.6f; dev[(size_t) n * 4 + 1] = -0.3f; dev[(size_t) n * 4 + 3] = 0.1f; }
-    Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-    m.process (MixerCore::Input {}, MixerCore::Input {}, MixerCore::Input { dev.data(), 4 }, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    NEAR (o.l[3], 0.6 + 0.1 * std::sqrt (0.5), 1e-6);                         // ch1 hard left, ch4 centred on strip 20; ch3 silent
-    NEAR (o.r[3], -0.3 + 0.1 * std::sqrt (0.5), 1e-6);
-    const auto pk = m.takePeaks();
-    NEAR (pk.strip[16], 0.6, 1e-6); NEAR (pk.strip[17], 0.3, 1e-6); CHECK (pk.strip[18] == 0.0f); NEAR (pk.strip[19], 0.1, 1e-6);
-    for (int i = 0; i < 16; ++i) CHECK (pk.strip[(size_t) i] == 0.0f);
-}
-
-TEST (input_bank_has_no_mono_duplication_and_solo_spans_three_banks)
-{
-    MixerCore m; m.setSettings (flat());
-    std::vector<float> dev (1 * 16, 0.5f);
-    Out o; o.l.assign (16, 0); o.r.assign (16, 0);
-    m.process (MixerCore::Input {}, MixerCore::Input {}, MixerCore::Input { dev.data(), 1 }, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    NEAR (o.l[2], 0.5 * std::sqrt (0.5), 1e-6);                               // only strip 17, not also strip 18
-
-    auto s = flat(); s.strips[20].solo = true; s.strips[20].pan = -1.0f;
-    MixerCore m2; m2.setSettings (s);
-    std::vector<float> net (2 * 16, 0.9f), app (8 * 16, 0.8f), in8 (8 * 16, 0.2f);
-    m2.process (MixerCore::Input { net.data(), 2 }, MixerCore::Input { app.data(), 8 }, MixerCore::Input { in8.data(), 8 }, 16, o.l.data(), o.r.data(), nullptr, nullptr);
-    NEAR (o.l[4], 0.2, 1e-6); NEAR (o.r[4], 0.0, 1e-6);                       // only the soloed input strip is heard
-}
-
-TEST (input_strip_direct_out_and_null_bank_are_safe)
-{
-    auto s = flat(); s.strips[23].directOut = 4; s.strips[23].pan = -1.0f;
-    MixerCore m; m.setSettings (s);
-    DirPtrs d (8); MixerCore::Routing r;
-    std::vector<float> in8 (8 * 8, 0.0f);
-    for (int n = 0; n < 8; ++n) in8[(size_t) n * 8 + 7] = 0.5f;
-    Out o; o.l.assign (8, 0); o.r.assign (8, 0);
-    m.process (MixerCore::Input {}, MixerCore::Input {}, MixerCore::Input { in8.data(), 8 }, 8, o.l.data(), o.r.data(), d.p.data(), &r);
-    CHECK (r.directCh[23] == 4);
-    NEAR (d.buf[23][3], 0.5, 1e-6); NEAR (o.l[3], 0.0, 1e-9);
-    // a bank that claims channels but has no data pointer must not be dereferenced
-    m.process (MixerCore::Input {}, MixerCore::Input { nullptr, 8 }, MixerCore::Input { nullptr, 8 }, 8, o.l.data(), o.r.data(), d.p.data(), &r);
-    for (float v : d.buf[23]) CHECK (v == 0.0f);
+    Dev e (2, 8);
+    std::vector<float> bad (8, std::numeric_limits<float>::quiet_NaN());
+    StereoOut n { bad.data(), bad.data(), 1 };
+    CHECK (routeToDevice (&n, 1, 8, e.p.data(), 2, 0));
+    CHECK (e.ch[0][0] == 0.0f && e.ch[1][0] == 0.0f);               // NaN is scrubbed
 }
 
 int main()
 {
-    for (auto& t : tests())
+    for (const auto& t : tests())
     {
         const int before = failures;
         t.f();
-        std::printf ("[%s] %s\n", failures == before ? "  OK  " : "FAILED", t.n);
+        std::printf ("%-36s %s\n", t.n, failures == before ? "ok" : "FAILED");
     }
     std::printf ("\n%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

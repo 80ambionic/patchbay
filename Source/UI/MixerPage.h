@@ -5,14 +5,19 @@
 #include <memory>
 #include "Mixer/MixerCore.h"
 #include "Mixer/MixerSettings.h"
+#include "MixerPresets.h"
 #include "Net/NetworkEngine.h"
 
 namespace pb
 {
-/** Page 3: the mixer console. 24 input strips - 8 network channels, 4 app-capture slots (stereo, so 2 strips each) and
-    8 audio-input-device channels - plus a master strip. Every strip can feed the master bus or go straight to a chosen device output; the master pair is
-    chosen too. Controls write straight into the MixerCore (lock-free), so changes are heard immediately; meters poll
-    the core ~30 times a second. */
+/** Page 3: the mixer console.
+      - 32 stereo input strips. Each has an Input menu (Off, a network pair, an app slot, or a stereo pair of the audio input
+        device) above an Output menu (Master or one of the 32 buses), a balance knob, mute/solo and a fader.
+      - 32 stereo output buses. Each ends at device outputs ("Audio Out") or a UDP stream ("Net Out").
+      - A master with the same choice. The master takes every strip whose Output is "Master".
+      - A preset bar: save, load and delete the whole mixer by name.
+    Controls write straight into the MixerCore (lock-free), so changes are heard immediately; meters poll the core ~30
+    times a second. */
 class MixerPage : public juce::Component, private juce::Timer
 {
 public:
@@ -28,31 +33,58 @@ public:
 
 private:
     class Meter;
-    class Strip;
+    class InputStrip;
+    class OutputStrip;
     class AppSlotPanel;
     class InputPanel;
     struct Content : juce::Component
     {
         void resized() override;
         void paint (juce::Graphics&) override;
-        std::vector<Strip*> strips;                // kMixerStrips channel strips
+        std::vector<InputStrip*> strips;           // kStrips
+        std::vector<OutputStrip*> buses;           // kBuses
         std::vector<AppSlotPanel*> slots;          // kAppSlots
         InputPanel* inputPanel = nullptr;
-        Strip* master = nullptr;
+        int inputsRight() const;
     };
 
     void timerCallback() override;
-    void changed() { if (onSettingsChanged) onSettingsChanged(); }
+    void changed();
     void syncOutputChoices();
+    void applyStrip (int i, const StripSettings&);
+    void applyBus (int b, const BusSettings&);
+    void applyMaster();
+    void applyAppNames();
+
+    void refreshPresetList (const juce::String& select);
+    void loadPreset (const juce::String& name);
+    void savePresetAs (const juce::String& name);
+    void promptSaveAs();
+    void promptDelete();
+    void updatePresetStatus();
 
     net::NetworkEngine& engine;
     MixerCore& core;
-    std::vector<std::unique_ptr<Strip>> strips;      // kMixerStrips channel strips, then the master strip
+    MixerPresets presets { MixerPresets::defaultFolder() };
+
+    std::vector<std::unique_ptr<InputStrip>> strips;
+    std::vector<std::unique_ptr<OutputStrip>> busStrips;
+    std::unique_ptr<OutputStrip> master;
     std::vector<std::unique_ptr<AppSlotPanel>> slotPanels;
     std::unique_ptr<InputPanel> inputPanel;
     Content content;
     juce::Viewport viewport;
+
+    // Preset bar
+    juce::Label presetTitle, presetStatus;
+    juce::ComboBox presetBox;
+    juce::TextButton saveButton { "Save" }, saveAsButton { "Save as..." }, deleteButton { "Delete" }, initButton { "Init" };
+    juce::String loadedPreset;                     // name of the preset the mixer was last loaded from / saved to ("" = none)
+    MixerSettings loadedSettings;                  // what it contained, to tell whether the mixer has been edited since
+    bool presetLoadInProgress = false;
+
     int clipHoldTicks = 0, tick = 0, lastNumOutputs = -1;
+    std::array<std::string, kAppSlots> appNames;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MixerPage)
 };

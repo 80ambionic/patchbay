@@ -37,6 +37,12 @@ struct PatchbayState
     MixerSettings mixer;
 };
 
+/** The mixer section on its own (used by the state file and by mixer presets). mixerFromVar fills `out` with defaults
+    first, then whatever valid fields the value holds; it returns false (leaving defaults) if the value is not a layout-2
+    mixer object, e.g. a file written by the 24-strip mixer of an earlier version. */
+juce::var mixerToVar (const MixerSettings&);
+bool mixerFromVar (const juce::var&, MixerSettings& out);
+
 /** Versioned JSON for PatchbayState. Parsing is defensive: a hand-edited, truncated or foreign file yields
     whatever valid entries it contains (or an empty state), never garbage entries or a crash. */
 juce::String toJson (const PatchbayState&);

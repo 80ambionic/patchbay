@@ -7,15 +7,50 @@ namespace pb
 namespace
 {
 const juce::Colour kBg (0xff15171b), kAppTint (0xff6ccfb8), kInTint (0xffe2b05a), kPanel (0xff23272e), kPanelHi (0xff2a2e35), kText (0xffd8dce2), kDim (0xff8a8f98),
-                   kGood (0xff6ccf8e), kWarn (0xfff0a35a), kBad (0xffe06c6c), kAccent (0xff5b9bd5);
+                   kGood (0xff6ccf8e), kWarn (0xfff0a35a), kBad (0xffe06c6c), kAccent (0xff5b9bd5), kNetTint (0xffb48ae0);
 
-constexpr int kStripW = 88, kMasterW = 116, kGap = 6, kMargin = 14, kGroupGap = 18, kHeaderH = 150, kStripH = 470;
+constexpr int kStripW = 88, kMasterW = 124, kGap = 6, kMargin = 14, kGroupGap = 28, kHeaderH = 150, kStripH = 500, kTitleH = 22;
 constexpr float kMeterFloorDb = -60.0f, kMeterCeilDb = 6.0f;
 
 float toDb (float lin) noexcept { return lin <= 1.0e-6f ? -120.0f : 20.0f * std::log10 (lin); }
 float dbToMeterPos (float db) noexcept { return juce::jlimit (0.0f, 1.0f, (db - kMeterFloorDb) / (kMeterCeilDb - kMeterFloorDb)); }
 
 juce::String faderText (double db) { return db <= (double) kMinGainDb + 0.001 ? juce::String ("-inf") : juce::String (db, 1) + " dB"; }
+
+juce::String pairName (const char* prefix, int pair) { return juce::String (prefix) + juce::String (2 * pair + 1) + "-" + juce::String (2 * pair + 2); }
+
+juce::Colour sourceTint (SourceType t)
+{
+    switch (t) { case SourceType::net: return kAccent; case SourceType::app: return kAppTint; case SourceType::input: return kInTint; default: return kDim; }
+}
+
+void styleFader (juce::Slider& fader, int textBoxWidth)
+{
+    fader.setSliderStyle (juce::Slider::LinearVertical);
+    fader.setRange (kMinGainDb, kMaxGainDb, 0.1);
+    fader.setDoubleClickReturnValue (true, 0.0);
+    fader.setTextBoxStyle (juce::Slider::TextBoxBelow, false, textBoxWidth, 22);
+    fader.textFromValueFunction = faderText;
+    fader.valueFromTextFunction = [] (const juce::String& t)
+    {
+        const auto s = t.trim().toLowerCase();
+        return s.startsWith ("-inf") ? (double) kMinGainDb : (double) clampGainDb (s.getFloatValue());
+    };
+    fader.setColour (juce::Slider::trackColourId, kPanelHi);
+    fader.setColour (juce::Slider::thumbColourId, kAccent);
+    fader.setColour (juce::Slider::textBoxTextColourId, kText);
+    fader.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    fader.setValue (0.0, juce::dontSendNotification);
+}
+
+void styleNameLabel (juce::Label& l, bool editable, float size, bool bold)
+{
+    l.setJustificationType (juce::Justification::centred);
+    l.setColour (juce::Label::textColourId, kText);
+    l.setColour (juce::Label::outlineWhenEditingColourId, kAccent);
+    l.setFont (juce::Font (juce::FontOptions (size, bold ? juce::Font::bold : juce::Font::plain)));
+    if (editable) l.setEditable (false, true, false);     // double-click to rename
+}
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -82,68 +117,61 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------------------------
-class MixerPage::Strip : public juce::Component
+/** One stereo input strip: [name] [Input menu] [Output menu] [balance] [M][S] [fader + stereo meter]. */
+class MixerPage::InputStrip : public juce::Component
 {
 public:
-    Strip (bool isMaster, int index, std::function<void()> onChange)
-        : master (isMaster), idx (index), changedCb (std::move (onChange)), meter (isMaster ? 2 : 1)
+    InputStrip (int index, std::function<void()> onChange) : idx (index), changedCb (std::move (onChange)), meter (2)
     {
+        styleNameLabel (nameLabel, true, 13.0f, false);
+        nameLabel.onTextChange = [this]
+        {
+            auto t = sanitizeStripName (nameLabel.getText().toStdString());
+            if (t.empty()) t = defaultName().toStdString();
+            nameIsDefault = (t == defaultName().toStdString());
+            nameLabel.setText (juce::String::fromUTF8 (t.c_str()), juce::dontSendNotification);
+            push();
+        };
+        addAndMakeVisible (nameLabel);
+
+        sourceBox.onChange = [this]
+        {
+            const int id = sourceBox.getSelectedId();
+            if (id <= 0) return;
+            src = idToSource (id);
+            if (nameIsDefault) nameLabel.setText (defaultName(), juce::dontSendNotification);
+            repaint();
+            push();
+        };
+        sourceBox.setTooltip ("Input: where this strip gets its stereo signal");
+        addAndMakeVisible (sourceBox);
+
         outBox.onChange = [this]
         {
             const int id = outBox.getSelectedId();
             if (id <= 0) return;
-            if (master) masterOutCh = id - 1000; else directOut = id - 1;          // ids: strips 1 = master, 2.. = Out 1..; master pair: 1000 + first channel
+            out = id - 1;
             push();
         };
+        outBox.setTooltip ("Output: the master or one of the 32 output buses");
         addAndMakeVisible (outBox);
-        rebuildOutChoices (0);
+        rebuildOutMenu();
+        rebuildSourceMenu();
 
-        if (! master)
-        {
-            nameLabel.setEditable (false, true, false);               // double-click to rename
-            nameLabel.setJustificationType (juce::Justification::centred);
-            nameLabel.setColour (juce::Label::textColourId, kText);
-            nameLabel.setColour (juce::Label::outlineWhenEditingColourId, kAccent);
-            nameLabel.onTextChange = [this]
-            {
-                auto t = sanitizeStripName (nameLabel.getText().toStdString());
-                if (t.empty()) t = defaultName().toStdString();
-                nameLabel.setText (juce::String::fromUTF8 (t.c_str()), juce::dontSendNotification);
-                changedCb();
-            };
-            nameLabel.setText (defaultName(), juce::dontSendNotification);
-            addAndMakeVisible (nameLabel);
+        balance.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        balance.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f, juce::MathConstants<float>::pi * 2.8f, true);
+        balance.setRange (-1.0, 1.0, 0.01);
+        balance.setDoubleClickReturnValue (true, 0.0);
+        balance.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        balance.setColour (juce::Slider::rotarySliderFillColourId, kAccent);
+        balance.setColour (juce::Slider::thumbColourId, kText);
+        balance.onValueChange = [this] { balText.setText ("Bal " + balanceText (balance.getValue()), juce::dontSendNotification); push(); };
+        addAndMakeVisible (balance);
 
-            pan.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-            pan.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f, juce::MathConstants<float>::pi * 2.8f, true);
-            pan.setRange (-1.0, 1.0, 0.01);
-            pan.setDoubleClickReturnValue (true, 0.0);
-            pan.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-            pan.setColour (juce::Slider::rotarySliderFillColourId, kAccent);
-            pan.setColour (juce::Slider::thumbColourId, kText);
-            pan.textFromValueFunction = [] (double v) { return std::abs (v) < 0.005 ? juce::String ("C") : (v < 0 ? "L" : "R") + juce::String ((int) std::round (std::abs (v) * 100.0)); };
-            pan.onValueChange = [this] { panText.setText ("Pan " + pan.getTextFromValue (pan.getValue()), juce::dontSendNotification); push(); };
-            addAndMakeVisible (pan);
-
-            panText.setJustificationType (juce::Justification::centred);
-            panText.setColour (juce::Label::textColourId, kDim);
-            panText.setFont (juce::Font (juce::FontOptions (11.5f)));
-            addAndMakeVisible (panText);
-
-            soloButton.setClickingTogglesState (true);
-            soloButton.setColour (juce::TextButton::buttonOnColourId, kWarn.darker (0.2f));
-            soloButton.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
-            soloButton.onClick = [this] { push(); };
-            addAndMakeVisible (soloButton);
-        }
-        else
-        {
-            nameLabel.setText ("Master", juce::dontSendNotification);
-            nameLabel.setJustificationType (juce::Justification::centred);
-            nameLabel.setColour (juce::Label::textColourId, kText);
-            nameLabel.setFont (juce::Font (juce::FontOptions (15.0f, juce::Font::bold)));
-            addAndMakeVisible (nameLabel);
-        }
+        balText.setJustificationType (juce::Justification::centred);
+        balText.setColour (juce::Label::textColourId, kDim);
+        balText.setFont (juce::Font (juce::FontOptions (11.5f)));
+        addAndMakeVisible (balText);
 
         muteButton.setClickingTogglesState (true);
         muteButton.setColour (juce::TextButton::buttonOnColourId, kBad.darker (0.2f));
@@ -151,77 +179,278 @@ public:
         muteButton.onClick = [this] { push(); };
         addAndMakeVisible (muteButton);
 
-        fader.setSliderStyle (juce::Slider::LinearVertical);
-        fader.setRange (kMinGainDb, kMaxGainDb, 0.1);
-        fader.setDoubleClickReturnValue (true, 0.0);
-        fader.setTextBoxStyle (juce::Slider::TextBoxBelow, false, kStripW - 20, 22);
-        fader.textFromValueFunction = faderText;
-        fader.valueFromTextFunction = [] (const juce::String& t)
-        {
-            const auto s = t.trim().toLowerCase();
-            return s.startsWith ("-inf") ? (double) kMinGainDb : (double) clampGainDb (s.getFloatValue());
-        };
-        fader.setColour (juce::Slider::trackColourId, kPanelHi);
-        fader.setColour (juce::Slider::thumbColourId, kAccent);
-        fader.setColour (juce::Slider::textBoxTextColourId, kText);
-        fader.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-        fader.setValue (0.0, juce::dontSendNotification);
+        soloButton.setClickingTogglesState (true);
+        soloButton.setColour (juce::TextButton::buttonOnColourId, kWarn.darker (0.2f));
+        soloButton.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+        soloButton.onClick = [this] { push(); };
+        addAndMakeVisible (soloButton);
+
+        styleFader (fader, kStripW - 20);
         fader.onValueChange = [this] { push(); };
         addAndMakeVisible (fader);
         addAndMakeVisible (meter);
+        balText.setText ("Bal C", juce::dontSendNotification);
+        nameLabel.setText (defaultName(), juce::dontSendNotification);
     }
 
-    /** Called by the page after construction: where this strip's controls write. */
-    std::function<void (const StripSettings&)> apply;      // channel strips
-    std::function<void (float, bool, int)> applyMaster;     // master strip: gain dB, mute, first output channel
+    std::function<void (const StripSettings&)> apply;
 
     StripSettings getStrip() const
     {
         StripSettings s;
+        s.src = src;
         s.gainDb = clampGainDb ((float) fader.getValue());
-        s.pan = clampPan ((float) pan.getValue());
+        s.balance = clampBalance ((float) balance.getValue());
         s.mute = muteButton.getToggleState();
         s.solo = soloButton.getToggleState();
-        s.directOut = clampDirectOut (directOut);
-        const auto n = sanitizeStripName (nameLabel.getText().toStdString());
-        s.name = n == defaultName().toStdString() ? std::string() : n;
+        s.out = clampStripOut (out);
+        s.name = nameIsDefault ? std::string() : sanitizeStripName (nameLabel.getText().toStdString());
         return s;
     }
 
     void setStrip (const StripSettings& s)
     {
+        src = s.src;
+        out = s.out;
         fader.setValue (s.gainDb, juce::dontSendNotification);
-        pan.setValue (s.pan, juce::dontSendNotification);
-        panText.setText ("Pan " + pan.getTextFromValue (s.pan), juce::dontSendNotification);
+        balance.setValue (s.balance, juce::dontSendNotification);
+        balText.setText ("Bal " + balanceText (s.balance), juce::dontSendNotification);
         muteButton.setToggleState (s.mute, juce::dontSendNotification);
         soloButton.setToggleState (s.solo, juce::dontSendNotification);
-        directOut = clampDirectOut (s.directOut);
-        rebuildOutChoices (lastNumOutputs);
-        nameLabel.setText (s.name.empty() ? defaultName() : juce::String::fromUTF8 (s.name.c_str()), juce::dontSendNotification);
+        nameIsDefault = s.name.empty();
+        nameLabel.setText (nameIsDefault ? defaultName() : juce::String::fromUTF8 (s.name.c_str()), juce::dontSendNotification);
+        rebuildSourceMenu();
+        rebuildOutMenu();
+        repaint();
     }
 
-    void setMaster (float db, bool mute, int outFirst)
+    /** App names as chosen in the App panels, shown in the Input menu ("App 1 - Safari"). */
+    void setAppNames (const std::array<std::string, kAppSlots>& names)
     {
-        fader.setValue (db, juce::dontSendNotification);
-        muteButton.setToggleState (mute, juce::dontSendNotification);
-        masterOutCh = clampMasterOut (outFirst);
-        rebuildOutChoices (lastNumOutputs);
+        if (names == appNames) return;
+        appNames = names;
+        if (! sourceBox.isPopupActive()) rebuildSourceMenu();
+        if (nameIsDefault) nameLabel.setText (defaultName(), juce::dontSendNotification);
     }
-    int masterOut() const { return clampMasterOut (masterOutCh); }
-
-    /** The device's output channel count changed (or the first query arrived): rebuild the routing menu. */
-    void setNumOutputs (int n) { rebuildOutChoices (n); }
-    float masterDb() const { return clampGainDb ((float) fader.getValue()); }
-    bool masterMute() const { return muteButton.getToggleState(); }
 
     Meter& getMeter() { return meter; }
-    bool isMaster() const noexcept { return master; }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.setColour (kPanel);
+        g.fillRoundedRectangle (getLocalBounds().toFloat(), 8.0f);
+        g.setColour (sourceTint (src.type).withAlpha (0.8f));
+        g.fillRoundedRectangle (getLocalBounds().toFloat().withHeight (4.0f).reduced (14.0f, 0.0f), 2.0f);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (8, 8);
+        nameLabel.setBounds (r.removeFromTop (22));
+        r.removeFromTop (4);
+        sourceBox.setBounds (r.removeFromTop (24));        // Input above Output
+        r.removeFromTop (4);
+        outBox.setBounds (r.removeFromTop (24));
+        r.removeFromTop (6);
+        balance.setBounds (r.removeFromTop (54).withSizeKeepingCentre (54, 54));
+        balText.setBounds (r.removeFromTop (16));
+        r.removeFromTop (6);
+
+        auto buttons = r.removeFromBottom (28);
+        r.removeFromBottom (6);
+        muteButton.setBounds (buttons.removeFromLeft (buttons.getWidth() / 2 - 2));
+        buttons.removeFromLeft (4);
+        soloButton.setBounds (buttons);
+
+        auto meterCol = r.removeFromRight (24);
+        meter.setBounds (meterCol.withTrimmedBottom (22));
+        r.removeFromRight (4);
+        fader.setBounds (r);
+    }
+
+private:
+    static juce::String balanceText (double v)
+    {
+        return std::abs (v) < 0.005 ? juce::String ("C") : (v < 0 ? "L" : "R") + juce::String ((int) std::round (std::abs (v) * 100.0));
+    }
+
+    static int sourceToId (Source s)
+    {
+        switch (s.type) { case SourceType::net: return 100 + s.index; case SourceType::app: return 200 + s.index; case SourceType::input: return 300 + s.index; default: return 1; }
+    }
+    static Source idToSource (int id)
+    {
+        Source s;
+        if (id >= 300) s = { SourceType::input, id - 300 }; else if (id >= 200) s = { SourceType::app, id - 200 };
+        else if (id >= 100) s = { SourceType::net, id - 100 }; else s = { SourceType::off, 0 };
+        s.sanitize();
+        return s;
+    }
+
+    juce::String appLabel (int slot) const
+    {
+        const auto& n = appNames[(size_t) slot];
+        return "App " + juce::String (slot + 1) + (n.empty() ? juce::String() : " - " + juce::String::fromUTF8 (n.c_str()));
+    }
+
+    juce::String defaultName() const
+    {
+        switch (src.type)
+        {
+            case SourceType::net:   return pairName ("Net ", src.index);
+            case SourceType::app:   { const auto& n = appNames[(size_t) src.index]; return n.empty() ? "App " + juce::String (src.index + 1) : juce::String::fromUTF8 (sanitizeStripName (n).c_str()); }
+            case SourceType::input: return pairName ("In ", src.index);
+            default:                return "Strip " + juce::String (idx + 1);
+        }
+    }
+
+    void rebuildSourceMenu()
+    {
+        sourceBox.clear (juce::dontSendNotification);
+        sourceBox.addItem ("Off", 1);
+        sourceBox.addSeparator();
+        sourceBox.addSectionHeading ("Network (Network page)");
+        for (int p = 0; p < kNetPairs; ++p) sourceBox.addItem (pairName ("Net ", p), 100 + p);
+        sourceBox.addSectionHeading ("Apps (virtual inputs)");
+        for (int a = 0; a < kAppSlots; ++a) sourceBox.addItem (appLabel (a), 200 + a);
+        sourceBox.addSectionHeading ("Audio input device");
+        for (int p = 0; p < kDevicePairs; ++p) sourceBox.addItem (pairName ("In ", p), 300 + p);
+        sourceBox.setSelectedId (sourceToId (src), juce::dontSendNotification);
+    }
+
+    void rebuildOutMenu()
+    {
+        outBox.clear (juce::dontSendNotification);
+        outBox.addItem ("Master", 1);
+        outBox.addSeparator();
+        for (int b = 1; b <= kBuses; ++b) outBox.addItem ("Bus " + juce::String (b), 1 + b);
+        outBox.setSelectedId (1 + clampStripOut (out), juce::dontSendNotification);
+    }
+
+    void push()
+    {
+        if (apply) apply (getStrip());
+        changedCb();
+    }
+
+    int idx;
+    std::function<void()> changedCb;
+    Source src;
+    int out = 0;
+    bool nameIsDefault = true;
+    std::array<std::string, kAppSlots> appNames;
+    juce::Label nameLabel, balText;
+    juce::ComboBox sourceBox, outBox;
+    juce::Slider balance, fader;
+    juce::TextButton muteButton { "M" }, soloButton { "S" };
+    Meter meter;
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+/** An output bus or the master: [name] [type: Audio Out / Net Out] [device pair, or the network destination] [M] [fader + meter]. */
+class MixerPage::OutputStrip : public juce::Component
+{
+public:
+    OutputStrip (bool isMaster, int index, std::function<void()> onChange)
+        : master (isMaster), idx (index), changedCb (std::move (onChange)), meter (2)
+    {
+        styleNameLabel (nameLabel, ! master, master ? 15.0f : 13.0f, master);
+        if (! master)
+        {
+            nameLabel.onTextChange = [this]
+            {
+                auto t = sanitizeStripName (nameLabel.getText().toStdString());
+                if (t.empty()) t = defaultName().toStdString();
+                nameLabel.setText (juce::String::fromUTF8 (t.c_str()), juce::dontSendNotification);
+                push();
+            };
+        }
+        nameLabel.setText (defaultName(), juce::dontSendNotification);
+        addAndMakeVisible (nameLabel);
+
+        typeBox.addItem ("Audio Out", 1);
+        typeBox.addItem ("Net Out", 2);
+        typeBox.setSelectedId (1, juce::dontSendNotification);
+        typeBox.setTooltip ("Where this output goes: sound card outputs, or a PatchBay network stream");
+        typeBox.onChange = [this]
+        {
+            const int id = typeBox.getSelectedId();
+            if (id <= 0) return;
+            type = id == 2 ? OutType::net : OutType::audio;
+            updateDestControls();
+            push();
+            if (type == OutType::net && dest.host.empty()) editDestination();       // nothing is sent until there is somewhere to send
+        };
+        addAndMakeVisible (typeBox);
+
+        outBox.onChange = [this]
+        {
+            const int id = outBox.getSelectedId();
+            if (id <= 0) return;
+            outFirst = id - 1000;
+            push();
+        };
+        addAndMakeVisible (outBox);
+
+        netButton.onClick = [this] { editDestination(); };
+        netButton.setColour (juce::TextButton::buttonColourId, kNetTint.darker (0.6f));
+        addChildComponent (netButton);
+
+        muteButton.setClickingTogglesState (true);
+        muteButton.setColour (juce::TextButton::buttonOnColourId, kBad.darker (0.2f));
+        muteButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        muteButton.onClick = [this] { push(); };
+        addAndMakeVisible (muteButton);
+
+        styleFader (fader, (master ? kMasterW : kStripW) - 20);
+        fader.onValueChange = [this] { push(); };
+        addAndMakeVisible (fader);
+        addAndMakeVisible (meter);
+
+        rebuildOutChoices (0);
+        updateDestControls();
+    }
+
+    std::function<void (const BusSettings&)> apply;
+
+    BusSettings getBus() const
+    {
+        BusSettings b;
+        b.gainDb = clampGainDb ((float) fader.getValue());
+        b.mute = muteButton.getToggleState();
+        b.type = type;
+        b.outFirst = clampOutFirst (outFirst);
+        b.dest = dest;
+        if (! master)
+        {
+            const auto n = sanitizeStripName (nameLabel.getText().toStdString());
+            b.name = n == defaultName().toStdString() ? std::string() : n;
+        }
+        return b;
+    }
+
+    void setBus (const BusSettings& b)
+    {
+        fader.setValue (b.gainDb, juce::dontSendNotification);
+        muteButton.setToggleState (b.mute, juce::dontSendNotification);
+        type = b.type;
+        outFirst = clampOutFirst (b.outFirst);
+        dest = b.dest;
+        typeBox.setSelectedId (type == OutType::net ? 2 : 1, juce::dontSendNotification);
+        if (! master) nameLabel.setText (b.name.empty() ? defaultName() : juce::String::fromUTF8 (b.name.c_str()), juce::dontSendNotification);
+        rebuildOutChoices (lastNumOutputs);
+        updateDestControls();
+    }
+
+    void setNumOutputs (int n) { rebuildOutChoices (n); }
+
+    Meter& getMeter() { return meter; }
 
     void paint (juce::Graphics& g) override
     {
         g.setColour (master ? kPanelHi : kPanel);
         g.fillRoundedRectangle (getLocalBounds().toFloat(), 8.0f);
-        g.setColour ((master ? kText : (idx < kNetworkStrips ? kAccent : (idx < kNetworkStrips + kAppStrips ? kAppTint : kInTint))).withAlpha (0.8f));
+        g.setColour ((master ? kText : (type == OutType::net ? kNetTint : kGood)).withAlpha (0.8f));
         g.fillRoundedRectangle (getLocalBounds().toFloat().withHeight (4.0f).reduced (14.0f, 0.0f), 2.0f);
         if (clipShown)
         {
@@ -243,92 +472,111 @@ public:
     void resized() override
     {
         auto r = getLocalBounds().reduced (8, 8);
-        nameLabel.setBounds (r.removeFromTop (24));
-        if (! master)
-        {
-            r.removeFromTop (4);
-            auto knob = r.removeFromTop (54);
-            pan.setBounds (knob.withSizeKeepingCentre (54, 54));
-            panText.setBounds (r.removeFromTop (16));
-        }
-        else
-        {
-            clipArea = r.removeFromTop (18).withSizeKeepingCentre (46, 16);
-            r.removeFromTop (4);
-        }
+        nameLabel.setBounds (r.removeFromTop (22));
         r.removeFromTop (4);
-        outBox.setBounds (r.removeFromTop (24));
+        typeBox.setBounds (r.removeFromTop (24));
+        r.removeFromTop (4);
+        auto destRow = r.removeFromTop (24);
+        outBox.setBounds (destRow);
+        netButton.setBounds (destRow);
         r.removeFromTop (6);
+        if (master) { clipArea = r.removeFromTop (18).withSizeKeepingCentre (46, 16); r.removeFromTop (4); }
+        else r.removeFromTop (74);                                    // lines the fader up with the input strips' fader
 
         auto buttons = r.removeFromBottom (28);
         r.removeFromBottom (6);
-        if (! master)
-        {
-            muteButton.setBounds (buttons.removeFromLeft (buttons.getWidth() / 2 - 2));
-            buttons.removeFromLeft (4);
-            soloButton.setBounds (buttons);
-        }
-        else
-            muteButton.setBounds (buttons);
+        muteButton.setBounds (buttons);
 
-        // Fader and meter side by side; the fader's text box sits under the fader only.
-        auto meterCol = r.removeFromRight (master ? 36 : 16);
+        auto meterCol = r.removeFromRight (master ? 36 : 24);
         meter.setBounds (meterCol.withTrimmedBottom (22));
         r.removeFromRight (4);
         fader.setBounds (r);
     }
 
 private:
-    juce::String defaultName() const
+    juce::String defaultName() const { return master ? juce::String ("Master") : "Bus " + juce::String (idx + 1); }
+
+    void updateDestControls()
     {
-        if (idx < kNetworkStrips) return "Net " + juce::String (idx + 1);
-        if (idx >= kNetworkStrips + kAppStrips) return "In " + juce::String (idx - kNetworkStrips - kAppStrips + 1);
-        const int a = idx - kNetworkStrips;
-        return "App" + juce::String (a / 2 + 1) + (a % 2 == 0 ? " L" : " R");
+        const bool net = type == OutType::net;
+        outBox.setVisible (! net);
+        netButton.setVisible (net);
+        netButton.setButtonText (dest.host.empty() ? juce::String ("Set destination...")
+                                                   : juce::String (dest.host) + ":" + juce::String (dest.port));
+        netButton.setTooltip ("Network destination. Click to change.");
+        repaint();
     }
 
-    /** Menu: strips get "Master" + "Out 1..N"; the master gets the output pairs. A saved choice the current device
-        cannot provide stays selectable, marked "(not on this device)", so opening a different device never loses it. */
+    /** Audio Out: the output pairs of the open device. A saved choice the current device cannot provide stays selectable,
+        marked "(not on this device)", so opening a different device never loses it. */
     void rebuildOutChoices (int numOutputs)
     {
         lastNumOutputs = numOutputs;
         const int n = std::clamp (numOutputs, 0, kMaxDeviceOutputs);
         outBox.clear (juce::dontSendNotification);
-        if (master)
-        {
-            const int pairs = std::max (1, n / 2);
-            for (int p = 0; p < pairs; ++p) outBox.addItem ("Out " + juce::String (2 * p + 1) + "-" + juce::String (2 * p + 2), 1000 + 2 * p + 1);
-            const int want = clampMasterOut (masterOutCh);
-            if (outBox.indexOfItemId (1000 + want) < 0)
-                outBox.addItem ("Out " + juce::String (want) + "-" + juce::String (want + 1) + " (not on this device)", 1000 + want);
-            outBox.setSelectedId (1000 + want, juce::dontSendNotification);
-        }
-        else
-        {
-            outBox.addItem ("Master", 1);
-            for (int c = 1; c <= n; ++c) outBox.addItem ("Out " + juce::String (c), 1 + c);
-            const int want = clampDirectOut (directOut);
-            if (want > 0 && outBox.indexOfItemId (1 + want) < 0)
-                outBox.addItem ("Out " + juce::String (want) + " (not on this device)", 1 + want);
-            outBox.setSelectedId (1 + want, juce::dontSendNotification);
-        }
+        const int pairs = std::max (1, n / 2);
+        for (int p = 0; p < pairs; ++p) outBox.addItem ("Out " + juce::String (2 * p + 1) + "-" + juce::String (2 * p + 2), 1000 + 2 * p + 1);
+        const int want = clampOutFirst (outFirst);
+        if (outBox.indexOfItemId (1000 + want) < 0)
+            outBox.addItem ("Out " + juce::String (want) + "-" + juce::String (want + 1) + " (not on this device)", 1000 + want);
+        outBox.setSelectedId (1000 + want, juce::dontSendNotification);
     }
+
+    /** A small dialog for host and port. Nothing is sent until a destination is set. */
+    void editDestination()
+    {
+        auto* w = new juce::AlertWindow ("Net Out destination",
+                                         "Send " + (master ? juce::String ("the master") : defaultNameForDialog()) + " as a PatchBay network stream (stereo) to:",
+                                         juce::MessageBoxIconType::NoIcon, this);
+        w->addTextEditor ("host", juce::String (dest.host), "Host name or IP address");
+        w->addTextEditor ("port", juce::String (dest.port), "Port (1-65535)");
+        w->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        w->addButton ("Clear", 2);
+        w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+        juce::Component::SafePointer<OutputStrip> self (this);
+        juce::Component::SafePointer<juce::AlertWindow> win (w);
+        w->enterModalState (true, juce::ModalCallbackFunction::create ([self, win] (int result)
+        {
+            if (self == nullptr || win == nullptr || result == 0) return;
+            if (result == 2) self->dest = NetDest();
+            else
+            {
+                const auto host = win->getTextEditorContents ("host").trim().toStdString();
+                const auto portText = win->getTextEditorContents ("port").trim();
+                const int port = portText.getIntValue();
+                const bool portOk = portText.containsOnly ("0123456789") && port >= 1 && port <= 65535;
+                if (host.empty() || ! isValidHost (host) || ! portOk)
+                {
+                    juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Net Out destination",
+                        "Enter a host name or IP address (letters, digits, '.', '-' and '_' only) and a port from 1 to 65535.");
+                    return;
+                }
+                self->dest = { host, port };
+            }
+            self->updateDestControls();
+            self->push();
+        }), true);
+    }
+
+    juce::String defaultNameForDialog() const { return nameLabel.getText().isEmpty() ? defaultName() : nameLabel.getText(); }
 
     void push()
     {
-        if (master) { if (applyMaster) applyMaster (masterDb(), masterMute(), masterOut()); }
-        else if (apply) apply (getStrip());
+        if (apply) apply (getBus());
         changedCb();
     }
 
     bool master;
     int idx;
     std::function<void()> changedCb;
-    juce::Label nameLabel, panText;
-    juce::ComboBox outBox;
-    int directOut = 0, masterOutCh = 1, lastNumOutputs = 0;
-    juce::Slider pan, fader;
-    juce::TextButton muteButton { "M" }, soloButton { "S" };
+    OutType type = OutType::audio;
+    int outFirst = 1, lastNumOutputs = 0;
+    NetDest dest;
+    juce::Label nameLabel;
+    juce::ComboBox typeBox, outBox;
+    juce::TextButton netButton { "Set destination..." }, muteButton { "M" };
+    juce::Slider fader;
     Meter meter;
     juce::Rectangle<int> clipArea;
     bool clipShown = false;
@@ -336,14 +584,14 @@ private:
 
 // ---------------------------------------------------------------------------------------------------------------
 /** One app-capture slot: pick a running app, switch capture on, choose whether to silence the app's own output.
-    Feeds the two strips below it (slot L / slot R). */
+    A strip whose Input is "App n" plays this slot. */
 class MixerPage::AppSlotPanel : public juce::Component
 {
 public:
     AppSlotPanel (net::NetworkEngine& e, int slotIndex, std::function<void()> onChange)
         : engine (e), slot (slotIndex), changedCb (std::move (onChange))
     {
-        title.setText ("App " + juce::String (slot + 1) + "  (virtual input)", juce::dontSendNotification);
+        title.setText ("App " + juce::String (slot + 1) + "  (stereo input)", juce::dontSendNotification);
         title.setColour (juce::Label::textColourId, kAppTint);
         title.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
         addAndMakeVisible (title);
@@ -382,6 +630,7 @@ public:
 
     void setTarget (const AppTarget& t)
     {
+        if (t == target) return;                  // loading a preset that keeps this app must not interrupt a running capture
         const bool wasOn = engine.isCaptureOn (slot);
         if (wasOn) stopCapture();
         target = t;
@@ -523,7 +772,8 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------------------------
-/** Audio input device (a microphone, an interface, or a virtual driver such as BlackHole) feeding strips 17-24.
+/** Audio input device (a microphone, an interface, or a virtual driver such as BlackHole): its channels are the stereo
+    pairs "In 1-2", "In 3-4", ... that a strip can take as its Input.
     Off after every launch: switching it on is what makes the OS ask for microphone access. */
 class MixerPage::InputPanel : public juce::Component
 {
@@ -563,7 +813,7 @@ public:
             const int n = engine.getNumInputs();
             auto* d = engine.getDeviceManager().getCurrentAudioDevice();
             text = (d != nullptr ? d->getName() : juce::String ("Audio device")) + "\n"
-                   + (n > 0 ? juce::String (n) + " input channel" + (n == 1 ? "" : "s") + " on strips In 1-" + juce::String (n)
+                   + (n > 0 ? juce::String (n) + " input channel" + (n == 1 ? "" : "s") + " (pairs In 1-2" + (n > 2 ? " ... In " + juce::String ((n - 1) / 2 * 2 + 1) + "-" + juce::String ((n - 1) / 2 * 2 + 2) : juce::String()) + ")"
                             : "No input channels are active. Pick an input in Audio device...")
                    + "\nUse headphones: a microphone feeding speakers will howl.";
         }
@@ -608,7 +858,7 @@ private:
         if (auto err = engine.prepareDevice(); err.isNotEmpty()) { errorText = "Audio device: " + err; update(); return; }
 
         // Inputs are listed here so they can be chosen; merely opening this dialog does not open an input.
-        auto* selector = new juce::AudioDeviceSelectorComponent (engine.getDeviceManager(), 0, kInputStrips, 2, kMaxDeviceOutputs, false, false, true, false);
+        auto* selector = new juce::AudioDeviceSelectorComponent (engine.getDeviceManager(), 0, kMaxDeviceInputs, 2, kMaxDeviceOutputs, false, false, true, false);
         selector->setSize (560, 520);
 
         juce::DialogWindow::LaunchOptions o;
@@ -632,25 +882,27 @@ private:
 // ---------------------------------------------------------------------------------------------------------------
 MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
 {
-    for (int i = 0; i < kMixerStrips; ++i)
+    for (int i = 0; i < kStrips; ++i)
     {
-        auto s = std::make_unique<Strip> (false, i, [this] { changed(); });
-        s->apply = [this, i] (const StripSettings& st)
-        {
-            core.setStripGainDb (i, st.gainDb); core.setStripPan (i, st.pan);
-            core.setStripMute (i, st.mute); core.setStripSolo (i, st.solo);
-            core.setStripDirectOut (i, st.directOut);
-        };
+        auto s = std::make_unique<InputStrip> (i, [this] { changed(); });
+        s->apply = [this, i] (const StripSettings& st) { applyStrip (i, st); };
         content.addAndMakeVisible (*s);
         content.strips.push_back (s.get());
         strips.push_back (std::move (s));
     }
 
-    auto m = std::make_unique<Strip> (true, kMixerStrips, [this] { changed(); });
-    m->applyMaster = [this] (float db, bool mute, int out) { core.setMasterDb (db); core.setMasterMute (mute); core.setMasterOut (out); };
-    content.addAndMakeVisible (*m);
-    content.master = m.get();
-    strips.push_back (std::move (m));
+    for (int b = 0; b < kBuses; ++b)
+    {
+        auto s = std::make_unique<OutputStrip> (false, b, [this] { changed(); });
+        s->apply = [this, b] (const BusSettings& bs) { applyBus (b, bs); };
+        content.addAndMakeVisible (*s);
+        content.buses.push_back (s.get());
+        busStrips.push_back (std::move (s));
+    }
+
+    master = std::make_unique<OutputStrip> (true, 0, [this] { changed(); });
+    master->apply = [this] (const BusSettings&) { applyMaster(); };
+    addAndMakeVisible (*master);
 
     for (int s = 0; s < kAppSlots; ++s)
     {
@@ -659,7 +911,6 @@ MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
         content.slots.push_back (p.get());
         slotPanels.push_back (std::move (p));
     }
-
     inputPanel = std::make_unique<InputPanel> (engine);
     content.addAndMakeVisible (*inputPanel);
     content.inputPanel = inputPanel.get();
@@ -667,6 +918,44 @@ MixerPage::MixerPage (net::NetworkEngine& e) : engine (e), core (e.getMixer())
     viewport.setViewedComponent (&content, false);
     viewport.setScrollBarsShown (true, true);
     addAndMakeVisible (viewport);
+
+    // Preset bar
+    presetTitle.setText ("Preset", juce::dontSendNotification);
+    presetTitle.setColour (juce::Label::textColourId, kDim);
+    addAndMakeVisible (presetTitle);
+    presetBox.setTextWhenNothingSelected ("(none)");
+    presetBox.onChange = [this]
+    {
+        if (presetLoadInProgress) return;
+        const auto name = presetBox.getText();
+        if (presetBox.getSelectedId() > 1 && name.isNotEmpty()) loadPreset (name);
+    };
+    addAndMakeVisible (presetBox);
+    saveButton.onClick = [this] { if (loadedPreset.isEmpty()) promptSaveAs(); else savePresetAs (loadedPreset); };
+    saveAsButton.onClick = [this] { promptSaveAs(); };
+    deleteButton.onClick = [this] { promptDelete(); };
+    initButton.setTooltip ("Reset every strip, bus and the master to the factory layout");
+    initButton.onClick = [this]
+    {
+        juce::Component::SafePointer<MixerPage> self (this);
+        auto* w = new juce::AlertWindow ("Reset the mixer?", "Every strip, bus and master setting goes back to the defaults. Presets on disk are not touched.",
+                                         juce::MessageBoxIconType::QuestionIcon, this);
+        w->addButton ("Reset", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        w->enterModalState (true, juce::ModalCallbackFunction::create ([self] (int r)
+        {
+            if (self == nullptr || r != 1) return;
+            self->setSettings (MixerSettings());
+            self->loadedPreset.clear();
+            self->refreshPresetList ({});
+            self->changed();
+        }), true);
+    };
+    for (auto* b : { &saveButton, &saveAsButton, &deleteButton, &initButton }) addAndMakeVisible (*b);
+    presetStatus.setColour (juce::Label::textColourId, kDim);
+    presetStatus.setFont (juce::Font (juce::FontOptions (12.0f)));
+    addAndMakeVisible (presetStatus);
+    refreshPresetList ({});
 
     setSettings (MixerSettings());
     syncOutputChoices();
@@ -678,10 +967,10 @@ MixerPage::~MixerPage() { stopTimer(); }
 MixerSettings MixerPage::getSettings() const
 {
     MixerSettings s;
-    for (int i = 0; i < kMixerStrips; ++i) s.strips[(size_t) i] = strips[(size_t) i]->getStrip();
-    s.masterDb = strips.back()->masterDb();
-    s.masterMute = strips.back()->masterMute();
-    s.masterOut = strips.back()->masterOut();
+    for (int i = 0; i < kStrips; ++i) s.strips[(size_t) i] = strips[(size_t) i]->getStrip();
+    for (int b = 0; b < kBuses; ++b) s.buses[(size_t) b] = busStrips[(size_t) b]->getBus();
+    const auto m = master->getBus();
+    s.masterDb = m.gainDb; s.masterMute = m.mute; s.masterType = m.type; s.masterOut = m.outFirst; s.masterDest = m.dest;
     for (int i = 0; i < kAppSlots; ++i) s.apps[(size_t) i] = slotPanels[(size_t) i]->getTarget();
     s.sanitize();
     return s;
@@ -691,10 +980,58 @@ void MixerPage::setSettings (const MixerSettings& in)
 {
     MixerSettings s = in;
     s.sanitize();
-    for (int i = 0; i < kMixerStrips; ++i) strips[(size_t) i]->setStrip (s.strips[(size_t) i]);
-    strips.back()->setMaster (s.masterDb, s.masterMute, s.masterOut);
+    for (int i = 0; i < kStrips; ++i) strips[(size_t) i]->setStrip (s.strips[(size_t) i]);
+    for (int b = 0; b < kBuses; ++b) busStrips[(size_t) b]->setBus (s.buses[(size_t) b]);
+    BusSettings m;
+    m.gainDb = s.masterDb; m.mute = s.masterMute; m.type = s.masterType; m.outFirst = s.masterOut; m.dest = s.masterDest;
+    master->setBus (m);
     for (int i = 0; i < kAppSlots; ++i) slotPanels[(size_t) i]->setTarget (s.apps[(size_t) i]);
+    applyAppNames();
+
     core.setSettings (s);
+    engine.setNetOutDestination (0, s.masterType == OutType::net ? s.masterDest.host : std::string(), s.masterDest.port);
+    for (int b = 0; b < kBuses; ++b)
+    {
+        const auto& bs = s.buses[(size_t) b];
+        engine.setNetOutDestination (b + 1, bs.type == OutType::net ? bs.dest.host : std::string(), bs.dest.port);
+    }
+    updatePresetStatus();
+}
+
+void MixerPage::applyStrip (int i, const StripSettings& st)
+{
+    core.setStripSource (i, st.src); core.setStripGainDb (i, st.gainDb); core.setStripBalance (i, st.balance);
+    core.setStripMute (i, st.mute); core.setStripSolo (i, st.solo); core.setStripOut (i, st.out);
+}
+
+void MixerPage::applyBus (int b, const BusSettings& bs)
+{
+    core.setBusGainDb (b, bs.gainDb); core.setBusMute (b, bs.mute); core.setBusType (b, bs.type); core.setBusOutFirst (b, bs.outFirst);
+    engine.setNetOutDestination (b + 1, bs.type == OutType::net ? bs.dest.host : std::string(), bs.dest.port);
+}
+
+void MixerPage::applyMaster()
+{
+    const auto m = master->getBus();
+    core.setMasterDb (m.gainDb); core.setMasterMute (m.mute); core.setMasterType (m.type); core.setMasterOut (m.outFirst);
+    engine.setNetOutDestination (0, m.type == OutType::net ? m.dest.host : std::string(), m.dest.port);
+}
+
+void MixerPage::applyAppNames()
+{
+    for (int i = 0; i < kAppSlots; ++i)
+    {
+        const auto t = slotPanels[(size_t) i]->getTarget();
+        appNames[(size_t) i] = t.bundleId.empty() ? std::string() : (t.name.empty() ? fallbackAppName (t.bundleId) : t.name);
+    }
+    for (auto& s : strips) s->setAppNames (appNames);
+}
+
+void MixerPage::changed()
+{
+    applyAppNames();
+    updatePresetStatus();
+    if (onSettingsChanged) onSettingsChanged();
 }
 
 void MixerPage::syncOutputChoices()
@@ -702,9 +1039,110 @@ void MixerPage::syncOutputChoices()
     const int n = engine.getNumOutputs();
     if (n == lastNumOutputs) return;
     lastNumOutputs = n;
-    for (auto& s : strips) s->setNumOutputs (n);
+    for (auto& b : busStrips) b->setNumOutputs (n);
+    master->setNumOutputs (n);
 }
 
+// ---- presets -------------------------------------------------------------------------------------------------------
+void MixerPage::refreshPresetList (const juce::String& select)
+{
+    presetLoadInProgress = true;
+    presetBox.clear (juce::dontSendNotification);
+    presetBox.addItem ("(none)", 1);
+    const auto names = presets.list();
+    for (int i = 0; i < names.size(); ++i) presetBox.addItem (names[i], i + 2);
+    int sel = 1;
+    for (int i = 0; i < names.size(); ++i) if (names[i] == select) sel = i + 2;
+    presetBox.setSelectedId (sel, juce::dontSendNotification);
+    presetLoadInProgress = false;
+    deleteButton.setEnabled (loadedPreset.isNotEmpty());
+    updatePresetStatus();
+}
+
+void MixerPage::updatePresetStatus()
+{
+    juce::String text;
+    if (loadedPreset.isEmpty()) text = "No preset loaded";
+    else text = loadedPreset + (getSettings() == loadedSettings ? juce::String() : juce::String ("  (edited - Save to update)"));
+    if (presetStatus.getText() != text) presetStatus.setText (text, juce::dontSendNotification);
+    deleteButton.setEnabled (loadedPreset.isNotEmpty());
+}
+
+void MixerPage::loadPreset (const juce::String& name)
+{
+    MixerSettings s;
+    juce::String err;
+    if (! presets.load (name.toStdString(), s, &err))
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Load preset", err);
+        refreshPresetList (loadedPreset);
+        return;
+    }
+    // Loading never starts anything: app capture, input and network listening stay as they are, and a preset's Net Out
+    // destinations only take effect once audio is running.
+    setSettings (s);
+    loadedPreset = name;
+    loadedSettings = getSettings();
+    refreshPresetList (name);
+    if (onSettingsChanged) onSettingsChanged();
+}
+
+void MixerPage::savePresetAs (const juce::String& rawName)
+{
+    const auto clean = sanitizePresetName (rawName.toStdString());
+    juce::String err;
+    const auto current = getSettings();
+    if (! presets.save (clean, current, &err))
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Save preset", err);
+        return;
+    }
+    loadedPreset = juce::String::fromUTF8 (clean.c_str());
+    loadedSettings = current;
+    refreshPresetList (loadedPreset);
+}
+
+void MixerPage::promptSaveAs()
+{
+    auto* w = new juce::AlertWindow ("Save mixer preset", "Name for this preset. Saving over an existing name replaces it.",
+                                     juce::MessageBoxIconType::NoIcon, this);
+    w->addTextEditor ("name", loadedPreset, "Preset name");
+    w->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<MixerPage> self (this);
+    juce::Component::SafePointer<juce::AlertWindow> win (w);
+    w->enterModalState (true, juce::ModalCallbackFunction::create ([self, win] (int r)
+    {
+        if (self == nullptr || win == nullptr || r != 1) return;
+        const auto clean = sanitizePresetName (win->getTextEditorContents ("name").toStdString());
+        if (clean.empty())
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Save preset",
+                                                    "Use letters, digits, spaces, '-', '_', '.', '(' or ')' in the name.");
+            return;
+        }
+        self->savePresetAs (juce::String::fromUTF8 (clean.c_str()));
+    }), true);
+}
+
+void MixerPage::promptDelete()
+{
+    if (loadedPreset.isEmpty()) return;
+    auto* w = new juce::AlertWindow ("Delete preset?", "Delete the preset \"" + loadedPreset + "\" from disk? The mixer itself is not changed.",
+                                     juce::MessageBoxIconType::QuestionIcon, this);
+    w->addButton ("Delete", 1);
+    w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<MixerPage> self (this);
+    w->enterModalState (true, juce::ModalCallbackFunction::create ([self] (int r)
+    {
+        if (self == nullptr || r != 1) return;
+        self->presets.remove (self->loadedPreset.toStdString());
+        self->loadedPreset.clear();
+        self->refreshPresetList ({});
+    }), true);
+}
+
+// ---- timer / layout ------------------------------------------------------------------------------------------------
 void MixerPage::timerCallback()
 {
     const auto p = core.takePeaks();                      // always drain, so a hidden page doesn't keep a stale clip flag
@@ -714,6 +1152,7 @@ void MixerPage::timerCallback()
         engine.refreshCaptures();
         for (auto& sp : slotPanels) sp->update();
         inputPanel->update();
+        updatePresetStatus();
     }
     if (tick % 90 == 0) for (auto& sp : slotPanels) sp->refreshAppList();     // ~3 s: apps started or quit
     if (tick % 15 == 0) syncOutputChoices();
@@ -721,68 +1160,84 @@ void MixerPage::timerCallback()
     if (! isShowing()) return;
 
     constexpr float dt = 1.0f / 30.0f;
-    for (int i = 0; i < kMixerStrips; ++i) strips[(size_t) i]->getMeter().update (&p.strip[(size_t) i], dt);
-
-    const float master[2] { p.masterL, p.masterR };
-    strips.back()->getMeter().update (master, dt);
-    if (p.clipped) { clipHoldTicks = 60; strips.back()->setClip (true); }
-    else if (clipHoldTicks > 0 && --clipHoldTicks == 0) strips.back()->setClip (false);
+    for (int i = 0; i < kStrips; ++i)
+    {
+        const float lr[2] { p.stripL[(size_t) i], p.stripR[(size_t) i] };
+        strips[(size_t) i]->getMeter().update (lr, dt);
+    }
+    for (int b = 0; b < kBuses; ++b)
+    {
+        const float lr[2] { p.busL[(size_t) b], p.busR[(size_t) b] };
+        busStrips[(size_t) b]->getMeter().update (lr, dt);
+    }
+    const float m[2] { p.masterL, p.masterR };
+    master->getMeter().update (m, dt);
+    if (p.clipped) { clipHoldTicks = 60; master->setClip (true); }
+    else if (clipHoldTicks > 0 && --clipHoldTicks == 0) master->setClip (false);
 }
 
 void MixerPage::resized()
 {
-    viewport.setBounds (getLocalBounds());
-    const int minW = 2 * kMargin + kMixerStrips * kStripW + (kMixerStrips - 1) * kGap + 3 * kGroupGap + kMasterW;
-    content.setSize (juce::jmax (minW, viewport.getMaximumVisibleWidth()),
-                     juce::jmax (kHeaderH + kStripH + 2 * kMargin, viewport.getMaximumVisibleHeight()));
+    auto r = getLocalBounds();
+    auto bar = r.removeFromTop (40).reduced (kMargin, 6);
+    presetTitle.setBounds (bar.removeFromLeft (52));
+    presetBox.setBounds (bar.removeFromLeft (220));
+    bar.removeFromLeft (8);
+    saveButton.setBounds (bar.removeFromLeft (64));
+    bar.removeFromLeft (4);
+    saveAsButton.setBounds (bar.removeFromLeft (84));
+    bar.removeFromLeft (4);
+    deleteButton.setBounds (bar.removeFromLeft (64));
+    bar.removeFromLeft (4);
+    initButton.setBounds (bar.removeFromLeft (56));
+    bar.removeFromLeft (12);
+    presetStatus.setBounds (bar);
+
+    // The master stays in view on the right while the strips and buses scroll.
+    auto masterArea = r.removeFromRight (kMasterW + 2 * kMargin);
+    master->setBounds (masterArea.getX() + kMargin, r.getY() + kMargin + kHeaderH + kGap + kTitleH, kMasterW, kStripH);
+
+    viewport.setBounds (r);
+    const int contentW = juce::jmax (content.inputsRight() + kGroupGap + kBuses * (kStripW + kGap) + kMargin, viewport.getMaximumVisibleWidth());
+    content.setSize (contentW, juce::jmax (kHeaderH + kStripH + kTitleH + kGap + 2 * kMargin, viewport.getMaximumVisibleHeight()));
 }
 
 void MixerPage::paint (juce::Graphics& g) { g.fillAll (kBg); }
 
+int MixerPage::Content::inputsRight() const { return kMargin + kStrips * (kStripW + kGap) - kGap; }
+
 void MixerPage::Content::paint (juce::Graphics& g)
 {
     g.fillAll (kBg);
-    g.setColour (kAccent);
+    const int y = kMargin + kHeaderH + kGap;
     g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
-    g.drawText ("NETWORK INPUT", kMargin + 4, kMargin + 6, 8 * kStripW, 20, juce::Justification::centredLeft);
-    g.setColour (kDim);
-    g.setFont (juce::Font (juce::FontOptions (12.0f)));
-    g.drawText ("Stream channel 1-8 from the Network page", kMargin + 4, kMargin + 28, 8 * kStripW, 20, juce::Justification::centredLeft);
+    g.setColour (kAccent);
+    g.drawText ("INPUTS - 32 stereo strips", kMargin + 4, y, 400, kTitleH, juce::Justification::centredLeft);
+    g.setColour (kGood);
+    g.drawText ("OUTPUT BUSES - 32 stereo", inputsRight() + kGroupGap + 4, y, 400, kTitleH, juce::Justification::centredLeft);
+    g.setColour (kDim.withAlpha (0.5f));
+    g.drawVerticalLine (inputsRight() + kGroupGap / 2, (float) y, (float) (y + kTitleH + kStripH));
 }
 
 void MixerPage::Content::resized()
 {
+    // Sources row (apps + input device) across the top; the strips and buses sit below it.
+    const int top = kMargin + kHeaderH + kGap + kTitleH;
     int x = kMargin;
-    const int top = kMargin + kHeaderH;
-
-    for (int i = 0; i < kNetworkStrips; ++i)
+    for (int i = 0; i < kStrips; ++i)
     {
         strips[(size_t) i]->setBounds (x, top, kStripW, kStripH);
-        x += kStripW + (i + 1 < kNetworkStrips ? kGap : 0);
+        x += kStripW + (i + 1 < kStrips ? kGap : 0);
     }
     x += kGroupGap;
-
-    for (int s = 0; s < kAppSlots; ++s)
+    for (int b = 0; b < kBuses; ++b)
     {
-        const int sx = x;
-        for (int k = 0; k < 2; ++k)
-        {
-            strips[(size_t) (kNetworkStrips + s * 2 + k)]->setBounds (x, top, kStripW, kStripH);
-            x += kStripW + kGap;
-        }
-        slots[(size_t) s]->setBounds (sx, kMargin, 2 * kStripW + kGap, kHeaderH - kGap);
-        if (s + 1 == kAppSlots) x -= kGap;
+        buses[(size_t) b]->setBounds (x, top, kStripW, kStripH);
+        x += kStripW + kGap;
     }
-    x += kGroupGap;
 
-    const int inX = x;
-    for (int k = 0; k < kInputStrips; ++k)
-    {
-        strips[(size_t) (kNetworkStrips + kAppStrips + k)]->setBounds (x, top, kStripW, kStripH);
-        x += kStripW + (k + 1 < kInputStrips ? kGap : 0);
-    }
-    if (inputPanel != nullptr) inputPanel->setBounds (inX, kMargin, 3 * kStripW + 2 * kGap, kHeaderH - kGap);
-    x += kGroupGap;
-    if (master != nullptr) master->setBounds (x, top, kMasterW, kStripH);
+    int sx = kMargin;
+    for (auto* s : slots) { s->setBounds (sx, kMargin, 2 * kStripW + kGap, kHeaderH - kGap); sx += 2 * kStripW + 2 * kGap; }
+    if (inputPanel != nullptr) inputPanel->setBounds (sx, kMargin, 3 * kStripW + 2 * kGap, kHeaderH - kGap);
 }
 }

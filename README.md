@@ -7,9 +7,11 @@ PatchBay's own virtual buses, and saved layout/routes.
 **Page 2 - Network (working):** receive audio over UDP and play it on any output device, with a jitter
 buffer, clock-drift correction, live stats and level meters. A second lane carries MIDI over the network
 (RTP-MIDI / AppleMIDI, interoperable with Logic, Audio MIDI Setup and Windows rtpMIDI).
-**Page 3 - Mixer (working):** a 24-strip console - 8 network channels, 4 stereo app-capture slots (browsers and
-music apps as virtual inputs, macOS 14.2+) and 8 audio-input-device channels - with per-strip fader, pan, mute, solo, rename, meters, per-strip output
-routing to any device output, a selectable master output pair and a clip indicator. Settings are saved.
+**Page 3 - Mixer (working):** 32 stereo input strips - each picks its own source from a menu (a network pair, one of 4
+app-capture slots, or a stereo pair of the audio input device) - and 32 stereo output buses plus a master. Every strip
+sends to the master or to a bus; the master and each bus end at sound-card outputs (**Audio Out**) or at a UDP stream to
+another machine (**Net Out**). Fader, balance, mute, solo, rename, meters, a clip indicator, and **presets** you can save
+and load by name. Settings are saved.
 
 ## Build the app
 
@@ -39,42 +41,63 @@ These scripts have never been run: the first build on real Xcode may need small 
     cmake --build build-tests && ctest --test-dir build-tests --output-on-failure
 
 That builds `net_tests` (packet codec, jitter buffer, resampler/playout, drift controller, output mapping,
-lock-free queue, route-loop guard) `mixer_tests` (mixer DSP, routing), `capture_tests` (resampling, drift, underrun; also run under TSan) and `app_grouping_tests`. On macOS, or elsewhere with `-DPATCHBAY_WITH_JUCE=ON`, it also builds
+lock-free queue, route-loop guard) `mixer_tests` (mixer DSP, routing, device router), `netout_tests` (Net Out packets and the UDP sender over real loopback sockets), `capture_tests` (resampling, drift, underrun; also run under TSan) and `app_grouping_tests`. On macOS, or elsewhere with `-DPATCHBAY_WITH_JUCE=ON`, it also builds
 `udp_loopback_test` (real sockets through the whole receive chain, float32 and int16) and `state_file_test`
-(persistence, corrupt-file handling). The CoreMIDI, audio-device and UI code can only be exercised by running the app.
+(persistence, mixer presets, corrupt-file handling). The CoreMIDI, audio-device and UI code can only be exercised by running the app.
 
 ## Using the Mixer page
-- **Strips 1-8** carry network stream channels 1-8. **Strips 9-16** are four stereo app slots (App1 L/R ... App4 L/R).
-  **Strips 17-24** (In 1-8) are the audio input device's channels.
-  Defaults: odd strips hard left, even strips hard right, so stereo sources play as stereo.
+Beta 2 layout. The top bar holds the **presets**; below it the Sources row (four App panels and the Audio input device
+panel), then the 32 input strips and the 32 output buses side by side (scroll sideways), and the master pinned on the right.
+- **Each input strip is stereo.** Its **Input** menu (above its Output menu) picks the source: *Off*, *Net 1-2 ... Net 7-8*
+  (pairs of the stream on the Network page), *App 1-4* (a capture slot, shown with the app's name), or *In 1-2 ... In 63-64*
+  (pairs of the audio input device). Out of the box strips 1-4 take the four network pairs, strips 5-8 the four app slots
+  and strips 9-32 the input device's pairs; nothing plays until the source is running (Listen, Capture, Use input device).
+  A pair that is missing plays silence; a mono stream or microphone plays on both sides.
+- Its **Output** menu picks *Master* or *Bus 1-32*. Changing it crossfades over one audio block, so it does not click.
 - **Fader** -60..+12 dB (bottom = off); double-click resets to 0 dB, type a value in the box to set it exactly.
-  **Pan** knob: double-click to centre. Pan law is constant power (-3 dB at centre).
-  **M** mutes, **S** solos (any solo silences the non-soloed strips; mute beats solo). Double-click a name to rename it.
-- **Output routing (multichannel).** Each strip's menu is *Master* or *Out N*. *Out N* sends that strip, post-fader and
-  without pan, straight to device output N and takes it off the master bus - for headphone feeds, cue sends, stems to an
-  interface. Several strips may share one output (they sum). The **master** menu picks which output pair the master bus
-  plays on (1-2, 3-4, ...). Menus list the open device's outputs; PatchBay opens *all* of them. A saved choice the current
-  device lacks stays selectable, marked "(not on this device)". "Out N" counts the outputs enabled in *Audio device...*.
-  Outputs that sum past full scale are clamped and light CLIP.
-- Meters are post-fader and pre-mute, so a muted strip still shows its signal. The master meter is post-clamp; **CLIP**
-  lights for about 2 s when the sum exceeded full scale (the output is hard-clamped at +-1, not limited).
+  **Balance** knob: unity at the centre, turning it away from a side fades that side (cos law, -3 dB at the quarter point);
+  double-click to centre. **M** mutes, **S** solos (any solo silences the non-soloed strips; mute beats solo; solo spans every
+  source). Double-click a name to rename it (the default follows the source).
+- **Each output bus is stereo** and has its own fader and mute. Its **type** menu is *Audio Out* or *Net Out*:
+  - *Audio Out*: pick the device output pair (Out 1-2, 3-4, ...). Menus list the open device's outputs; PatchBay opens *all*
+    of them. A saved choice the current device lacks stays selectable, marked "(not on this device)". Outputs that sum past
+    full scale are clamped and light CLIP.
+  - *Net Out*: sends the bus as a stereo PatchBay stream (float32, 128-frame packets, the same wire format the Network page
+    receives) to a host and port you type in. Nothing is sent until a destination is set, and a stream only flows while at
+    least one strip is routed to that bus. IPv4 only. Point it at another PatchBay's Listen port.
+- **The master** collects every strip whose Output is *Master*, has its own fader/mute and the same Audio Out / Net Out
+  choice. Buses do not pass through the master; each goes straight to its own destination.
+- A bus whose type is *Net Out* sends only while audio is running (Listen, an app capture or the input device is on, because
+  the sound card's clock drives the mixer). Do not point a Net Out at your own Listen port unless you want a feedback loop.
+- Meters are stereo, post-fader and pre-mute on strips (a muted strip still shows its signal), post-everything on buses and
+  the master. **CLIP** lights for about 2 s when a bus or the master exceeded full scale (hard-clamped at +-1, not limited).
 - Gain and routing changes ramp across the audio block (no zipper noise or clicks). Non-finite samples from a bad sender
   are replaced by silence.
 
+### Presets
+The bar at the top saves the whole mixer under a name: every strip (source, fader, balance, mute, solo, output, name), every
+bus and the master (fader, mute, Audio Out / Net Out, device pair or destination, name) and the four app targets. Files are
+`<app data>/PatchBay/Presets/<name>.pbmix` (small JSON). Choose a name from the menu to load it, **Save** to update the
+loaded preset, **Save as...** for a new name, **Delete** to remove it, **Init** to go back to the factory layout. The bar says
+"(edited)" when the mixer differs from the loaded preset. Loading a preset never starts anything: app capture, the input
+device and network listening stay as they are, and a preset's app targets only replace the current ones when they differ.
+Preset names are limited to letters, digits, spaces and `- _ . ( )`. Mixer settings saved by the earlier 24-strip mixer are
+not carried over (the new mixer starts at its defaults).
+
 ### Audio input device (microphone, interface, virtual driver)
-The *Audio input device* panel (above strips In 1-8) feeds the first 8 channels of the default input device to strips 17-24.
+The *Audio input device* panel opens up to 64 channels of the default input device; they appear as the stereo pairs *In 1-2 ... In 63-64* in every strip's Input menu.
 - **Use input device** is off after every launch and is the only thing that opens an input, so the microphone permission
   prompt appears when you press it, not before. **Audio device...** lets you pick a different input and its channels.
 - This is also how a virtual audio driver such as BlackHole or Loopback works as a source: set the app's (or the system's)
   output to the driver, then choose the driver as PatchBay's input.
-- A microphone feeding speakers will howl: use headphones, or route those strips with *Out N* to something that is not heard.
+- A microphone feeding speakers will howl: use headphones, or route those strips to a bus that does not play on the speakers.
 - Input and output share one JUCE device. If they are two different physical devices, CoreAudio runs them on separate
   clocks and PatchBay does not resample between them; prefer one interface, or a macOS aggregate device.
 - Sandboxed builds need the `com.apple.security.device.audio-input` entitlement; iOS asks for microphone access
   (the usage string is in CMakeLists.txt).
 
 ### Browsers and music apps as virtual inputs (macOS 14.2+)
-Each *App* panel above the app strips captures one app's audio using Core Audio process taps:
+Each *App* panel in the Sources row captures one app's audio using Core Audio process taps; a strip whose Input is *App n* plays it:
 1. Pick the app from the menu (apps that have touched the audio system, playing ones first; the list refreshes every few
    seconds). Press **Capture**. The first time, macOS asks for permission: allow PatchBay under
    *System Settings > Privacy & Security > Screen & System Audio Recording*.
@@ -123,8 +146,8 @@ The wrapper (`Source/Midi/NetworkMidiSession.mm`) is Objective-C++ and has only 
 3. **Buffer** sets the jitter-buffer depth in packets and takes effect live: lower is less latency,
    higher rides out more network jitter. **Audio device...** picks the output device.
 
-The stream now goes through the mixer: stream channel *i* feeds strip *i*, and the master bus plays on device outputs 1 and 2
-(a mono stream feeds strips 1 and 2; a mono device gets the sum; outputs 3+ are silent). Settings are saved, but
+The stream now goes through the mixer: channel pairs 1-2, 3-4, 5-6 and 7-8 are the Input choices *Net 1-2 ... Net 7-8*, and by default the master plays on device outputs 1 and 2
+(a mono stream plays on both sides of *Net 1-2*; a mono device gets the sum). Settings are saved, but
 the app never starts listening by itself: you press Listen every launch.
 
 Wire format (header big-endian, payload little-endian; details in `Source/Net/Packet.h`):
@@ -170,8 +193,11 @@ Limitations you should know about:
     Source/Midi/NetMidiTypes.h     RTP-MIDI settings model + host validation (pure C++)
     Source/Midi/NetworkMidiSession.*  MIDINetworkSession wrapper (C++ header, Objective-C++ implementation)
     Source/Mixer/MixerSettings.h   mixer settings model + clamping (pure C++)
-    Source/Mixer/MixerCore.h       mixer DSP: gain, pan, mute/solo, direct outs, master, meters (pure C++, lock-free)
-    Source/Mixer/DeviceRouter.h    places master + direct outs on device output channels (pure C++)
+    Source/Mixer/MixerCore.h       mixer DSP: 32 stereo strips -> master / 32 buses, balance, mute/solo, meters (pure C++, lock-free)
+    Source/Mixer/DeviceRouter.h    places stereo outputs (master + Audio Out buses) on device output channels (pure C++)
+    Source/MixerPresets.*          named mixer presets on disk
+    Source/Net/NetOut.h            Net Out packetizer (pure C++, wait-free)
+    Source/Net/UdpSender.*         Net Out UDP sender thread (POSIX sockets)
     Source/Capture/CaptureStream.h rate-converting, drift-correcting ring for captured audio (pure C++)
     Source/Capture/AppGrouping.h   which audio process belongs to which app (pure C++)
     Source/Capture/AppCapture.*    Core Audio process-tap wrapper (C++ header, Objective-C++ / ARC implementation)

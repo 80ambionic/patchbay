@@ -45,10 +45,12 @@ if(APPLE)
       Source/Main.cpp
       Source/MainComponent.cpp
       Source/StateFile.cpp
+      Source/MixerPresets.cpp
       Source/Midi/VirtualBuses.cpp
     Source/Midi/NetworkMidiSession.mm
     Source/Capture/AppCapture.mm
       Source/Net/UdpReceiver.cpp
+    Source/Net/UdpSender.cpp
     Source/Net/NetworkEngine.cpp
     Source/UI/MixerPage.cpp
     Source/UI/NetworkAudioLane.cpp
@@ -104,6 +106,12 @@ if(PATCHBAY_BUILD_TESTS)
   target_link_libraries(mixer_tests PRIVATE Threads::Threads)
   add_test(NAME mixer_tests COMMAND mixer_tests)
 
+  add_executable(netout_tests Tests/netout_tests.cpp Source/Net/UdpSender.cpp)
+  target_include_directories(netout_tests PRIVATE Source)
+  target_compile_features(netout_tests PRIVATE cxx_std_20)
+  target_link_libraries(netout_tests PRIVATE Threads::Threads)
+  add_test(NAME netout_tests COMMAND netout_tests)
+
   add_executable(capture_tests Tests/capture_tests.cpp)
   target_include_directories(capture_tests PRIVATE Source)
   target_compile_features(capture_tests PRIVATE cxx_std_20)
@@ -125,7 +133,7 @@ if(PATCHBAY_BUILD_TESTS)
     add_test(NAME udp_loopback_test COMMAND udp_loopback_test)
 
     juce_add_console_app(state_file_test PRODUCT_NAME "state_file_test")
-    target_sources(state_file_test PRIVATE Tests/state_file_test.cpp Source/StateFile.cpp)
+    target_sources(state_file_test PRIVATE Tests/state_file_test.cpp Source/StateFile.cpp Source/MixerPresets.cpp)
     target_include_directories(state_file_test PRIVATE Source)
     target_compile_features(state_file_test PRIVATE cxx_std_20)
     target_compile_definitions(state_file_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
